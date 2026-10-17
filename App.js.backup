@@ -1,0 +1,1301 @@
+import React, { useState } from 'react';
+import {
+  SafeAreaView,
+  StatusBar,
+  StyleSheet,
+  Text,
+  View,
+  ScrollView,
+  TextInput,
+  TouchableOpacity,
+  Platform,
+} from 'react-native';
+
+const COLORS = {
+  background: '#090D18',
+  surface: '#111827',
+  card: '#151E30',
+  border: '#253149',
+  primary: '#6C8CFF',
+  text: '#F4F7FF',
+  muted: '#8C9AB5',
+  green: '#36D6A0',
+  purple: '#B29AFF',
+};
+
+const initialChats = [
+  {
+    id: '1',
+    name: 'Alex Morgan',
+    initials: 'AM',
+    message: 'Hey! Are you nearby?',
+    time: '10:42',
+    color: '#304B77',
+    unread: 2,
+    online: true,
+  },
+  {
+    id: '2',
+    name: 'Sarah Wilson',
+    initials: 'SW',
+    message: 'Photo received successfully',
+    time: '09:18',
+    color: '#654A80',
+    unread: 0,
+    online: false,
+  },
+  {
+    id: '3',
+    name: 'Daniel Carter',
+    initials: 'DC',
+    message: 'Can you send that PDF?',
+    time: 'Yesterday',
+    color: '#386B64',
+    unread: 0,
+    online: true,
+  },
+];
+
+const initialRequests = [
+  {
+    id: 'r1',
+    name: 'Jordan Lee',
+    initials: 'JL',
+    detail: 'Wants to connect with you',
+    color: '#7558A6',
+  },
+];
+
+function Avatar({ initials, color, size = 52, online = false }) {
+  return (
+    <View
+      style={[
+        styles.avatar,
+        {
+          width: size,
+          height: size,
+          borderRadius: size / 3,
+          backgroundColor: color,
+        },
+      ]}
+    >
+      <Text style={[styles.avatarText, { fontSize: size * 0.29 }]}>
+        {initials}
+      </Text>
+
+      {online && <View style={styles.onlineDot} />}
+    </View>
+  );
+}
+
+function SectionTitle({ title, action, onPress }) {
+  return (
+    <View style={styles.sectionHeader}>
+      <Text style={styles.sectionTitle}>{title}</Text>
+
+      {action && (
+        <TouchableOpacity onPress={onPress} activeOpacity={0.7}>
+          <Text style={styles.sectionAction}>{action}</Text>
+        </TouchableOpacity>
+      )}
+    </View>
+  );
+}
+
+export default function App() {
+  const [activeTab, setActiveTab] = useState('Home');
+  const [search, setSearch] = useState('');
+  const [chats, setChats] = useState(initialChats);
+  const [requests, setRequests] = useState(initialRequests);
+  const [notice, setNotice] = useState('');
+
+  const filteredChats = chats.filter((chat) =>
+    chat.name.toLowerCase().includes(search.toLowerCase())
+  );
+
+  const showNotice = (message) => {
+    setNotice(message);
+  };
+
+  const handleRequest = (id, accepted) => {
+    const request = requests.find((item) => item.id === id);
+
+    setRequests((previous) => previous.filter((item) => item.id !== id));
+
+    if (accepted && request) {
+      setChats((previous) => [
+        {
+          id: `chat-${Date.now()}`,
+          name: request.name,
+          initials: request.initials,
+          message: 'You are now connected',
+          time: 'Now',
+          color: request.color,
+          unread: 0,
+          online: false,
+        },
+        ...previous,
+      ]);
+
+      showNotice(`${request.name} added to your chats`);
+    } else {
+      showNotice('Connection request declined');
+    }
+  };
+
+  const openTab = (tab) => {
+    setActiveTab(tab);
+    setNotice('');
+  };
+
+  const renderHome = () => (
+    <>
+      <View style={styles.welcomeRow}>
+        <View style={styles.welcomeText}>
+          <Text style={styles.eyebrow}>YOUR PRIVATE SPACE</Text>
+          <Text style={styles.heading}>Stay connected.</Text>
+          <Text style={styles.subtitle}>
+            Chat directly. Share freely.
+          </Text>
+        </View>
+
+        <TouchableOpacity
+          style={styles.profileButton}
+          onPress={() => openTab('Profile')}
+          accessibilityLabel="Open profile"
+        >
+          <Text style={styles.profileInitial}>A</Text>
+          <View style={styles.profileOnline} />
+        </TouchableOpacity>
+      </View>
+
+      <View style={styles.connectionBanner}>
+        <View style={styles.bannerIcon}>
+          <Text style={styles.bannerIconText}>⌁</Text>
+        </View>
+
+        <View style={styles.bannerContent}>
+          <Text style={styles.bannerTitle}>Ready to connect?</Text>
+          <Text style={styles.bannerDescription}>
+            Find nearby ChatHub devices.
+          </Text>
+        </View>
+
+        <View style={styles.statusPill}>
+          <View style={styles.statusDot} />
+          <Text style={styles.statusText}>Ready</Text>
+        </View>
+      </View>
+
+      <SectionTitle
+        title="Quick actions"
+      />
+
+      <View style={styles.actionRow}>
+        <TouchableOpacity
+          style={styles.actionCard}
+          onPress={() => openTab('Nearby')}
+          activeOpacity={0.8}
+        >
+          <View style={[styles.actionIcon, { backgroundColor: '#24365D' }]}>
+            <Text style={styles.actionEmoji}>⌕</Text>
+          </View>
+          <Text style={styles.actionTitle}>Find nearby</Text>
+          <Text style={styles.actionSubtitle}>Discover devices</Text>
+          <Text style={styles.actionArrow}>↗</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={styles.actionCard}
+          onPress={() => openTab('Requests')}
+          activeOpacity={0.8}
+        >
+          <View style={[styles.actionIcon, { backgroundColor: '#352B57' }]}>
+            <Text style={styles.actionEmoji}>♧</Text>
+          </View>
+          <Text style={styles.actionTitle}>Requests</Text>
+          <Text style={styles.actionSubtitle}>Manage invites</Text>
+          {requests.length > 0 && (
+            <View style={styles.actionBadge}>
+              <Text style={styles.actionBadgeText}>{requests.length}</Text>
+            </View>
+          )}
+          <Text style={styles.actionArrow}>↗</Text>
+        </TouchableOpacity>
+      </View>
+
+      <SectionTitle
+        title="Connection requests"
+        action="View all"
+        onPress={() => openTab('Requests')}
+      />
+
+      {requests.length === 0 ? (
+        <View style={styles.emptyInline}>
+          <Text style={styles.emptyText}>No pending requests.</Text>
+        </View>
+      ) : (
+        requests.slice(0, 2).map((request) => (
+          <View style={styles.requestCard} key={request.id}>
+            <Avatar
+              initials={request.initials}
+              color={request.color}
+              size={48}
+            />
+
+            <View style={styles.requestInfo}>
+              <Text style={styles.personName}>{request.name}</Text>
+              <Text style={styles.personDetail}>{request.detail}</Text>
+            </View>
+
+            <TouchableOpacity
+              style={styles.acceptButton}
+              onPress={() => handleRequest(request.id, true)}
+            >
+              <Text style={styles.acceptText}>✓</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.declineButton}
+              onPress={() => handleRequest(request.id, false)}
+            >
+              <Text style={styles.declineText}>×</Text>
+            </TouchableOpacity>
+          </View>
+        ))
+      )}
+
+      <SectionTitle
+        title="Recent chats"
+        action="See all"
+        onPress={() => openTab('Chats')}
+      />
+
+      {filteredChats.length === 0 ? (
+        <View style={styles.emptyInline}>
+          <Text style={styles.emptyText}>No chats match your search.</Text>
+        </View>
+      ) : (
+        filteredChats.slice(0, 3).map(renderChatRow)
+      )}
+
+      <View style={styles.privacyNote}>
+        <Text style={styles.privacyIcon}>◇</Text>
+        <View style={styles.privacyContent}>
+          <Text style={styles.privacyTitle}>Your conversations, your space</Text>
+          <Text style={styles.privacyDescription}>
+            ChatHub is being built for direct device-to-device communication.
+          </Text>
+        </View>
+      </View>
+    </>
+  );
+
+  function renderChatRow(chat) {
+    return (
+      <TouchableOpacity
+        key={chat.id}
+        style={styles.chatRow}
+        activeOpacity={0.75}
+        onPress={() => showNotice(`Chat with ${chat.name} is not connected yet`)}
+      >
+        <Avatar
+          initials={chat.initials}
+          color={chat.color}
+          online={chat.online}
+          size={51}
+        />
+
+        <View style={styles.chatContent}>
+          <Text style={styles.personName}>{chat.name}</Text>
+          <Text style={styles.chatMessage} numberOfLines={1}>
+            {chat.message}
+          </Text>
+        </View>
+
+        <View style={styles.chatMeta}>
+          <Text style={styles.chatTime}>{chat.time}</Text>
+          {chat.unread > 0 && (
+            <View style={styles.unreadBadge}>
+              <Text style={styles.unreadText}>{chat.unread}</Text>
+            </View>
+          )}
+        </View>
+      </TouchableOpacity>
+    );
+  }
+
+  const renderNearby = () => (
+    <View style={styles.pageContent}>
+      <Text style={styles.eyebrow}>DISCOVER</Text>
+      <Text style={styles.pageHeading}>Nearby devices</Text>
+      <Text style={styles.subtitle}>
+        Find people around you using ChatHub.
+      </Text>
+
+      <View style={styles.scannerCard}>
+        <View style={styles.scannerCircle}>
+          <Text style={styles.scannerSymbol}>⌁</Text>
+        </View>
+        <Text style={styles.scannerTitle}>Nearby discovery</Text>
+        <Text style={styles.scannerDescription}>
+          Native device discovery has not been connected yet.
+        </Text>
+
+        <TouchableOpacity
+          style={styles.primaryButton}
+          onPress={() =>
+            showNotice(
+              'Discovery will work after Nearby Connections is integrated.'
+            )
+          }
+        >
+          <Text style={styles.primaryButtonText}>Prepare discovery</Text>
+        </TouchableOpacity>
+      </View>
+
+      <View style={styles.infoCard}>
+        <Text style={styles.infoTitle}>How it will work</Text>
+        <Text style={styles.infoLine}>01  Enable nearby permissions</Text>
+        <Text style={styles.infoLine}>02  Discover active ChatHub devices</Text>
+        <Text style={styles.infoLine}>03  Send a connection request</Text>
+        <Text style={styles.infoLine}>04  Connect after acceptance</Text>
+      </View>
+    </View>
+  );
+
+  const renderRequests = () => (
+    <View style={styles.pageContent}>
+      <Text style={styles.eyebrow}>CONNECTIONS</Text>
+      <Text style={styles.pageHeading}>Requests</Text>
+      <Text style={styles.subtitle}>
+        Decide who you want to connect with.
+      </Text>
+
+      {requests.length === 0 ? (
+        <View style={styles.emptyCard}>
+          <Text style={styles.emptyIcon}>♧</Text>
+          <Text style={styles.emptyTitle}>All caught up</Text>
+          <Text style={styles.emptyText}>No pending connection requests.</Text>
+        </View>
+      ) : (
+        requests.map((request) => (
+          <View style={styles.requestPageCard} key={request.id}>
+            <Avatar initials={request.initials} color={request.color} />
+            <View style={styles.requestInfo}>
+              <Text style={styles.personName}>{request.name}</Text>
+              <Text style={styles.personDetail}>{request.detail}</Text>
+              <View style={styles.requestActions}>
+                <TouchableOpacity
+                  style={styles.acceptLarge}
+                  onPress={() => handleRequest(request.id, true)}
+                >
+                  <Text style={styles.acceptLargeText}>Accept</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.declineLarge}
+                  onPress={() => handleRequest(request.id, false)}
+                >
+                  <Text style={styles.declineLargeText}>Decline</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        ))
+      )}
+    </View>
+  );
+
+  const renderChats = () => (
+    <View style={styles.pageContent}>
+      <Text style={styles.eyebrow}>MESSAGES</Text>
+      <Text style={styles.pageHeading}>Your chats</Text>
+      <Text style={styles.subtitle}>Your recent conversations.</Text>
+
+      <View style={styles.searchBox}>
+        <Text style={styles.searchIcon}>⌕</Text>
+        <TextInput
+          value={search}
+          onChangeText={setSearch}
+          placeholder="Search conversations..."
+          placeholderTextColor={COLORS.muted}
+          style={styles.searchInput}
+        />
+      </View>
+
+      {filteredChats.map(renderChatRow)}
+    </View>
+  );
+
+  const renderProfile = () => (
+    <View style={styles.pageContent}>
+      <Text style={styles.eyebrow}>ACCOUNT</Text>
+      <Text style={styles.pageHeading}>Your profile</Text>
+
+      <View style={styles.profileCard}>
+        <View style={styles.largeProfile}>
+          <Text style={styles.largeProfileText}>A</Text>
+        </View>
+        <Text style={styles.profileName}>ChatHub User</Text>
+        <Text style={styles.profileDescription}>Personal device profile</Text>
+        <View style={styles.profileStatus}>
+          <View style={styles.statusDot} />
+          <Text style={styles.profileStatusText}>Ready to connect</Text>
+        </View>
+      </View>
+
+      <View style={styles.infoCard}>
+        <Text style={styles.infoTitle}>App information</Text>
+        <Text style={styles.infoLine}>App: ChatHub</Text>
+        <Text style={styles.infoLine}>Mode: Offline-first</Text>
+        <Text style={styles.infoLine}>Account: Local profile</Text>
+      </View>
+
+      <Text style={styles.profileFootnote}>
+        Profile editing and secure identity setup will be added in a later step.
+      </Text>
+    </View>
+  );
+
+  const renderCurrentPage = () => {
+    switch (activeTab) {
+      case 'Nearby':
+        return renderNearby();
+      case 'Requests':
+        return renderRequests();
+      case 'Chats':
+        return renderChats();
+      case 'Profile':
+        return renderProfile();
+      default:
+        return renderHome();
+    }
+  };
+
+  const tabs = [
+    { label: 'Home', icon: '⌂' },
+    { label: 'Nearby', icon: '⌕' },
+    { label: 'Chats', icon: '▤' },
+    { label: 'Requests', icon: '♧' },
+    { label: 'Profile', icon: '○' },
+  ];
+
+  return (
+    <SafeAreaView style={styles.safeArea}>
+      <StatusBar style="light" backgroundColor={COLORS.background} />
+
+      <View style={styles.appContainer}>
+        <View style={styles.topBar}>
+          <TouchableOpacity
+            style={styles.brand}
+            onPress={() => openTab('Home')}
+          >
+            <View style={styles.brandMark}>
+              <Text style={styles.brandMarkText}>C</Text>
+            </View>
+            <Text style={styles.brandName}>
+              Chat<Text style={styles.brandAccent}>Hub</Text>
+            </Text>
+          </TouchableOpacity>
+
+          <View style={styles.topBarRight}>
+            <View style={styles.encryptedBadge}>
+              <Text style={styles.encryptedIcon}>◇</Text>
+              <Text style={styles.encryptedText}>PRIVATE</Text>
+            </View>
+          </View>
+        </View>
+
+        <View style={styles.searchBox}>
+          <Text style={styles.searchIcon}>⌕</Text>
+          <TextInput
+            value={search}
+            onChangeText={setSearch}
+            placeholder="Search chats..."
+            placeholderTextColor={COLORS.muted}
+            style={styles.searchInput}
+            returnKeyType="search"
+          />
+          {search.length > 0 && (
+            <TouchableOpacity onPress={() => setSearch('')}>
+              <Text style={styles.clearSearch}>×</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+
+        {notice ? (
+          <TouchableOpacity
+            style={styles.notice}
+            onPress={() => setNotice('')}
+            activeOpacity={0.8}
+          >
+            <Text style={styles.noticeText}>{notice}</Text>
+            <Text style={styles.noticeClose}>×</Text>
+          </TouchableOpacity>
+        ) : null}
+
+        <ScrollView
+          style={styles.scrollView}
+          contentContainerStyle={styles.scrollContent}
+          showsVerticalScrollIndicator={false}
+          keyboardShouldPersistTaps="handled"
+        >
+          {renderCurrentPage()}
+          <View style={styles.bottomSpacer} />
+        </ScrollView>
+
+        <View style={styles.bottomNav}>
+          {tabs.map((tab) => {
+            const active = activeTab === tab.label;
+
+            return (
+              <TouchableOpacity
+                key={tab.label}
+                style={styles.navItem}
+                onPress={() => openTab(tab.label)}
+                activeOpacity={0.7}
+              >
+                <View style={[styles.navIconBox, active && styles.navIconActive]}>
+                  <Text
+                    style={[
+                      styles.navIcon,
+                      active && styles.navIconSelected,
+                    ]}
+                  >
+                    {tab.icon}
+                  </Text>
+                  {tab.label === 'Requests' && requests.length > 0 && (
+                    <View style={styles.navBadge} />
+                  )}
+                </View>
+                <Text style={[styles.navLabel, active && styles.navLabelActive]}>
+                  {tab.label}
+                </Text>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+      </View>
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  safeArea: {
+    flex: 1,
+    backgroundColor: COLORS.background,
+    paddingTop: Platform.OS === 'android' ? 0 : 0,
+  },
+  appContainer: {
+    flex: 1,
+    backgroundColor: COLORS.background,
+  },
+  topBar: {
+    height: 65,
+    paddingHorizontal: 21,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    borderBottomWidth: 1,
+    borderBottomColor: '#182237',
+  },
+  brand: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  brandMark: {
+    width: 35,
+    height: 35,
+    borderRadius: 12,
+    backgroundColor: COLORS.primary,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  brandMarkText: {
+    color: '#FFFFFF',
+    fontSize: 20,
+    fontWeight: '900',
+  },
+  brandName: {
+    color: COLORS.text,
+    fontSize: 23,
+    fontWeight: '800',
+    letterSpacing: -0.7,
+  },
+  brandAccent: {
+    color: COLORS.primary,
+  },
+  topBarRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  encryptedBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    backgroundColor: '#152A2A',
+    borderRadius: 20,
+  },
+  encryptedIcon: {
+    color: COLORS.green,
+    fontSize: 13,
+  },
+  encryptedText: {
+    color: COLORS.green,
+    fontSize: 9,
+    fontWeight: '800',
+    letterSpacing: 1,
+  },
+  searchBox: {
+    height: 47,
+    marginHorizontal: 20,
+    marginTop: 17,
+    marginBottom: 7,
+    paddingHorizontal: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: COLORS.surface,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: 14,
+  },
+  searchIcon: {
+    color: COLORS.muted,
+    fontSize: 25,
+    marginRight: 9,
+  },
+  searchInput: {
+    flex: 1,
+    color: COLORS.text,
+    fontSize: 14,
+    paddingVertical: 8,
+  },
+  clearSearch: {
+    color: COLORS.muted,
+    fontSize: 24,
+    paddingLeft: 10,
+  },
+  scrollView: {
+    flex: 1,
+  },
+  scrollContent: {
+    paddingHorizontal: 20,
+    paddingTop: 16,
+  },
+  welcomeRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 21,
+  },
+  welcomeText: {
+    flex: 1,
+    paddingRight: 10,
+  },
+  eyebrow: {
+    color: COLORS.primary,
+    fontSize: 10,
+    fontWeight: '800',
+    letterSpacing: 1.7,
+    marginBottom: 8,
+  },
+  heading: {
+    color: COLORS.text,
+    fontSize: 27,
+    lineHeight: 33,
+    fontWeight: '800',
+    letterSpacing: -0.8,
+  },
+  subtitle: {
+    color: COLORS.muted,
+    fontSize: 13,
+    lineHeight: 20,
+    marginTop: 5,
+  },
+  profileButton: {
+    width: 48,
+    height: 48,
+    borderRadius: 17,
+    backgroundColor: '#293A61',
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#465D8F',
+  },
+  profileInitial: {
+    color: '#FFFFFF',
+    fontSize: 21,
+    fontWeight: '800',
+  },
+  profileOnline: {
+    position: 'absolute',
+    right: -2,
+    bottom: -2,
+    width: 13,
+    height: 13,
+    borderRadius: 7,
+    backgroundColor: COLORS.green,
+    borderWidth: 2,
+    borderColor: COLORS.background,
+  },
+  connectionBanner: {
+    minHeight: 91,
+    padding: 15,
+    backgroundColor: '#172747',
+    borderRadius: 19,
+    borderWidth: 1,
+    borderColor: '#2C416B',
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 27,
+  },
+  bannerIcon: {
+    width: 45,
+    height: 45,
+    borderRadius: 15,
+    backgroundColor: '#2A3F70',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginRight: 12,
+  },
+  bannerIconText: {
+    color: '#AFC3FF',
+    fontSize: 31,
+    lineHeight: 36,
+  },
+  bannerContent: {
+    flex: 1,
+  },
+  bannerTitle: {
+    color: COLORS.text,
+    fontSize: 14,
+    fontWeight: '800',
+  },
+  bannerDescription: {
+    color: '#A8B7D6',
+    fontSize: 11,
+    marginTop: 5,
+  },
+  statusPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#173D3B',
+    borderRadius: 15,
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+    gap: 5,
+  },
+  statusDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: COLORS.green,
+  },
+  statusText: {
+    color: COLORS.green,
+    fontSize: 10,
+    fontWeight: '700',
+  },
+  sectionHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 13,
+    marginTop: 2,
+  },
+  sectionTitle: {
+    color: COLORS.text,
+    fontSize: 16,
+    fontWeight: '800',
+    letterSpacing: -0.2,
+  },
+  sectionAction: {
+    color: COLORS.primary,
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  actionRow: {
+    flexDirection: 'row',
+    gap: 12,
+    marginBottom: 27,
+  },
+  actionCard: {
+    flex: 1,
+    minHeight: 145,
+    padding: 14,
+    backgroundColor: COLORS.surface,
+    borderRadius: 17,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    position: 'relative',
+  },
+  actionIcon: {
+    width: 39,
+    height: 39,
+    borderRadius: 13,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 12,
+  },
+  actionEmoji: {
+    color: '#DCE5FF',
+    fontSize: 28,
+  },
+  actionTitle: {
+    color: COLORS.text,
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  actionSubtitle: {
+    color: COLORS.muted,
+    fontSize: 10,
+    marginTop: 5,
+  },
+  actionArrow: {
+    color: COLORS.primary,
+    fontSize: 19,
+    position: 'absolute',
+    top: 13,
+    right: 13,
+  },
+  actionBadge: {
+    position: 'absolute',
+    top: 14,
+    right: 35,
+    width: 19,
+    height: 19,
+    borderRadius: 10,
+    backgroundColor: '#ED7191',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  actionBadgeText: {
+    color: '#FFFFFF',
+    fontSize: 10,
+    fontWeight: '800',
+  },
+  requestCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: COLORS.surface,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: 16,
+    padding: 12,
+    marginBottom: 25,
+  },
+  requestInfo: {
+    flex: 1,
+    marginLeft: 11,
+    marginRight: 6,
+  },
+  personName: {
+    color: COLORS.text,
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  personDetail: {
+    color: COLORS.muted,
+    fontSize: 10,
+    marginTop: 5,
+  },
+  acceptButton: {
+    width: 34,
+    height: 34,
+    borderRadius: 11,
+    backgroundColor: '#173D36',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  acceptText: {
+    color: COLORS.green,
+    fontSize: 19,
+    fontWeight: '800',
+  },
+  declineButton: {
+    width: 34,
+    height: 34,
+    borderRadius: 11,
+    backgroundColor: '#33212D',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginLeft: 7,
+  },
+  declineText: {
+    color: '#FF8BA7',
+    fontSize: 22,
+  },
+  chatRow: {
+    minHeight: 75,
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: '#1A2438',
+  },
+  avatar: {
+    justifyContent: 'center',
+    alignItems: 'center',
+    position: 'relative',
+  },
+  avatarText: {
+    color: '#FFFFFF',
+    fontWeight: '800',
+  },
+  onlineDot: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    backgroundColor: COLORS.green,
+    position: 'absolute',
+    right: -2,
+    bottom: -2,
+    borderWidth: 2,
+    borderColor: COLORS.background,
+  },
+  chatContent: {
+    flex: 1,
+    marginLeft: 12,
+    marginRight: 6,
+  },
+  chatMessage: {
+    color: COLORS.muted,
+    fontSize: 11,
+    marginTop: 6,
+  },
+  chatMeta: {
+    alignItems: 'flex-end',
+    justifyContent: 'center',
+    gap: 8,
+  },
+  chatTime: {
+    color: COLORS.muted,
+    fontSize: 9,
+  },
+  unreadBadge: {
+    minWidth: 18,
+    height: 18,
+    paddingHorizontal: 5,
+    borderRadius: 9,
+    backgroundColor: COLORS.primary,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  unreadText: {
+    color: '#FFFFFF',
+    fontSize: 9,
+    fontWeight: '800',
+  },
+  privacyNote: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    padding: 14,
+    marginTop: 24,
+    backgroundColor: '#121F27',
+    borderRadius: 15,
+    borderWidth: 1,
+    borderColor: '#203B3A',
+  },
+  privacyIcon: {
+    color: COLORS.green,
+    fontSize: 23,
+    marginRight: 10,
+  },
+  privacyContent: {
+    flex: 1,
+  },
+  privacyTitle: {
+    color: '#C7F7E6',
+    fontSize: 11,
+    fontWeight: '800',
+  },
+  privacyDescription: {
+    color: '#8EBAAE',
+    fontSize: 10,
+    lineHeight: 16,
+    marginTop: 5,
+  },
+  bottomNav: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-around',
+    minHeight: 72,
+    paddingTop: 7,
+    paddingBottom: Platform.OS === 'android' ? 7 : 10,
+    backgroundColor: '#0E1422',
+    borderTopWidth: 1,
+    borderTopColor: '#202A40',
+  },
+  navItem: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  navIconBox: {
+    width: 39,
+    height: 31,
+    borderRadius: 11,
+    alignItems: 'center',
+    justifyContent: 'center',
+    position: 'relative',
+  },
+  navIconActive: {
+    backgroundColor: '#25365D',
+  },
+  navIcon: {
+    color: COLORS.muted,
+    fontSize: 23,
+  },
+  navIconSelected: {
+    color: '#AFC2FF',
+  },
+  navLabel: {
+    color: COLORS.muted,
+    fontSize: 9,
+    marginTop: 4,
+    fontWeight: '600',
+  },
+  navLabelActive: {
+    color: '#B7C7FF',
+    fontWeight: '800',
+  },
+  navBadge: {
+    position: 'absolute',
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+    backgroundColor: '#FF829F',
+    top: 3,
+    right: 4,
+    borderWidth: 1,
+    borderColor: '#0E1422',
+  },
+  notice: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#263552',
+    borderRadius: 11,
+    marginHorizontal: 20,
+    marginTop: 5,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  noticeText: {
+    color: '#DCE5FF',
+    fontSize: 11,
+    flex: 1,
+  },
+  noticeClose: {
+    color: '#DCE5FF',
+    fontSize: 20,
+    marginLeft: 8,
+  },
+  pageContent: {
+    paddingTop: 15,
+    paddingBottom: 20,
+  },
+  pageHeading: {
+    color: COLORS.text,
+    fontSize: 28,
+    fontWeight: '800',
+    letterSpacing: -0.7,
+  },
+  scannerCard: {
+    marginTop: 28,
+    paddingHorizontal: 22,
+    paddingVertical: 30,
+    alignItems: 'center',
+    backgroundColor: COLORS.surface,
+    borderRadius: 22,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  scannerCircle: {
+    width: 104,
+    height: 104,
+    borderRadius: 52,
+    backgroundColor: '#202F51',
+    borderWidth: 1,
+    borderColor: '#425C92',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 23,
+  },
+  scannerSymbol: {
+    color: '#AFC3FF',
+    fontSize: 65,
+  },
+  scannerTitle: {
+    color: COLORS.text,
+    fontSize: 19,
+    fontWeight: '800',
+  },
+  scannerDescription: {
+    color: COLORS.muted,
+    fontSize: 12,
+    lineHeight: 20,
+    textAlign: 'center',
+    marginTop: 10,
+    marginBottom: 22,
+  },
+  primaryButton: {
+    backgroundColor: COLORS.primary,
+    paddingHorizontal: 22,
+    paddingVertical: 13,
+    borderRadius: 13,
+  },
+  primaryButtonText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  infoCard: {
+    padding: 18,
+    marginTop: 18,
+    backgroundColor: COLORS.surface,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  infoTitle: {
+    color: COLORS.text,
+    fontSize: 14,
+    fontWeight: '800',
+    marginBottom: 15,
+  },
+  infoLine: {
+    color: '#B1BED5',
+    fontSize: 12,
+    marginVertical: 7,
+    lineHeight: 18,
+  },
+  emptyInline: {
+    paddingVertical: 20,
+    alignItems: 'center',
+  },
+  emptyText: {
+    color: COLORS.muted,
+    fontSize: 12,
+    lineHeight: 19,
+  },
+  emptyCard: {
+    alignItems: 'center',
+    padding: 27,
+    marginTop: 30,
+    backgroundColor: COLORS.surface,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  emptyIcon: {
+    fontSize: 39,
+    color: COLORS.primary,
+    marginBottom: 14,
+  },
+  emptyTitle: {
+    color: COLORS.text,
+    fontSize: 17,
+    fontWeight: '800',
+    marginBottom: 8,
+  },
+  requestPageCard: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    backgroundColor: COLORS.surface,
+    borderRadius: 17,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    padding: 14,
+    marginTop: 18,
+  },
+  requestActions: {
+    flexDirection: 'row',
+    gap: 9,
+    marginTop: 15,
+  },
+  acceptLarge: {
+    paddingHorizontal: 16,
+    paddingVertical: 9,
+    borderRadius: 10,
+    backgroundColor: COLORS.primary,
+  },
+  acceptLargeText: {
+    color: '#FFFFFF',
+    fontSize: 11,
+    fontWeight: '800',
+  },
+  declineLarge: {
+    paddingHorizontal: 16,
+    paddingVertical: 9,
+    borderRadius: 10,
+    backgroundColor: '#252E40',
+  },
+  declineLargeText: {
+    color: '#CFD8EA',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  profileCard: {
+    alignItems: 'center',
+    backgroundColor: COLORS.surface,
+    borderRadius: 22,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    padding: 27,
+    marginTop: 24,
+  },
+  largeProfile: {
+    width: 86,
+    height: 86,
+    borderRadius: 27,
+    backgroundColor: '#304B77',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: '#4D6C9E',
+  },
+  largeProfileText: {
+    color: '#FFFFFF',
+    fontSize: 38,
+    fontWeight: '800',
+  },
+  profileName: {
+    color: COLORS.text,
+    fontSize: 19,
+    fontWeight: '800',
+    marginTop: 17,
+  },
+  profileDescription: {
+    color: COLORS.muted,
+    fontSize: 12,
+    marginTop: 6,
+  },
+  profileStatus: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 7,
+    marginTop: 15,
+    backgroundColor: '#173D36',
+    borderRadius: 20,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  profileStatusText: {
+    color: COLORS.green,
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  profileFootnote: {
+    color: COLORS.muted,
+    fontSize: 11,
+    lineHeight: 18,
+    textAlign: 'center',
+    marginTop: 18,
+  },
+  bottomSpacer: {
+    height: 20,
+  },
+});

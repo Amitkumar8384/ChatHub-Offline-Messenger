@@ -1,6 +1,9 @@
 import React, { useEffect, useState, useRef } from 'react';
 
 import {
+  Alert,
+  Image,
+  Modal,
   StatusBar,
   StyleSheet,
   Text,
@@ -17,6 +20,17 @@ import { nearby } from './src/nearby';
 import { requestNearbyPermissions } from './src/nearbyPermissions';
 import { Ionicons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import {
+  AudioModule,
+  RecordingPresets,
+  setAudioModeAsync,
+  useAudioPlayer,
+  useAudioPlayerStatus,
+  useAudioRecorder,
+} from 'expo-audio';
+import * as DocumentPicker from 'expo-document-picker';
+import * as Sharing from 'expo-sharing';
+import * as Crypto from 'expo-crypto';
 
 const COLORS = {
   background: '#070B14',
@@ -29,6 +43,37 @@ const COLORS = {
   green: '#36D6A0',
   purple: '#B29AFF',
 };
+
+function mergeRestoredChats(savedChats, currentChats) {
+  const chatKey = chat => chat.id || chat.endpointId;
+  const chatsByEndpoint = new Map(savedChats.map(chat => [chatKey(chat), chat]));
+
+  currentChats.forEach(currentChat => {
+    const key = chatKey(currentChat);
+    const savedChat = chatsByEndpoint.get(key);
+    if (!savedChat) {
+      chatsByEndpoint.set(key, currentChat);
+      return;
+    }
+
+    const messagesById = new Map();
+    [...(savedChat.messages || []), ...(currentChat.messages || [])].forEach(message => {
+      messagesById.set(message.id, message);
+    });
+    const latestChat = (currentChat.updatedAt || 0) >= (savedChat.updatedAt || 0)
+      ? currentChat
+      : savedChat;
+
+    chatsByEndpoint.set(key, {
+      ...savedChat,
+      ...currentChat,
+      ...latestChat,
+      messages: [...messagesById.values()].sort((a, b) => (a.sentAt || 0) - (b.sentAt || 0)),
+    });
+  });
+
+  return [...chatsByEndpoint.values()].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+}
 
 
 
@@ -111,6 +156,31 @@ function EmptyState({ icon, title, description }) {
   );
 }
 
+function VoiceMessage({ uri }) {
+  const player = useAudioPlayer(uri || null);
+  const status = useAudioPlayerStatus(player);
+
+  return (
+    <TouchableOpacity
+      style={styles.voiceMessageButton}
+      accessibilityRole="button"
+      accessibilityLabel={status.playing ? 'Pause voice message' : 'Play voice message'}
+      onPress={() => status.playing ? player.pause() : player.play()}
+      disabled={!uri}
+      activeOpacity={0.75}
+    >
+      <Ionicons
+        name={status.playing ? 'pause-circle' : 'play-circle'}
+        size={24}
+        color={COLORS.primary}
+      />
+      <Text style={styles.voiceMessageLabel}>
+        {status.playing ? 'Playing voice message' : 'Voice message'}
+      </Text>
+    </TouchableOpacity>
+  );
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState('Home');
   const [searchQuery, setSearchQuery] = useState('');
@@ -125,8 +195,63 @@ export default function App() {
   const [notice, setNotice] = useState('');
   const [selectedChat, setSelectedChat] = useState(null);
   const selectedChatRef = useRef(null);
-  const [profileName, setProfileName] = useState('Amit');
+  const [isGroupModalOpen, setIsGroupModalOpen] = useState(false);
+  const [newGroupName, setNewGroupName] = useState('');
+  const [selectedGroupMembers, setSelectedGroupMembers] = useState([]);
+  const [profileName, setProfileName] = useState('');
+  const [profileId, setProfileId] = useState('');
+  const profileIdRef = useRef('');
+  const [profileSetupName, setProfileSetupName] = useState('');
+  const [isProfileSetupVisible, setIsProfileSetupVisible] = useState(false);
+  const profileNameDirtyRef = useRef(false);
   const [isEditingProfile, setIsEditingProfile] = useState(false);
+  const audioRecorder = useAudioRecorder({
+    ...RecordingPresets.LOW_QUALITY,
+    directory: 'document',
+  });
+  const [isRecordingVoice, setIsRecordingVoice] = useState(false);
+  const [blockedDevices, setBlockedDevices] = useState([]);
+  const blockedDevicesRef = useRef(new Map());
+  const blockedDevicesLoadedRef = useRef(false);
+
+  function getGeneratedDisplayName(id = profileId) {
+    const shortId = id.replace(/-/g, '').slice(0, 6).toUpperCase();
+    return shortId ? `User-${shortId}` : 'ChatHub User';
+  }
+
+  function getFullProfileId(id = profileId) {
+    return id ? `CH-${id.toUpperCase()}` : '';
+  }
+
+  function getPublicDisplayName(name = profileName, id = profileIdRef.current || profileId) {
+    const shortId = id.replace(/-/g, '').slice(0, 8).toUpperCase();
+    const displayName = name.trim() || getGeneratedDisplayName(id);
+    return shortId ? `${displayName} · CH-${shortId}` : displayName;
+  }
+
+  async function persistProfileName(name) {
+    const savedName = name.trim() || getGeneratedDisplayName(profileIdRef.current);
+    setProfileName(savedName);
+    profileNameDirtyRef.current = false;
+    await AsyncStorage.setItem('@chathub/profile-name', savedName);
+
+    if (scanningRef.current) {
+      await nearby.stopAdvertising();
+      await nearby.startAdvertising(getPublicDisplayName(savedName));
+    }
+    return savedName;
+  }
+
+  async function finishProfileSetup(name) {
+    try {
+      const savedName = await persistProfileName(name);
+      setIsProfileSetupVisible(false);
+      setNotice(`Profile saved as ${savedName}`);
+    } catch (error) {
+      console.warn('Could not save profile:', error);
+      setNotice('Could not save profile. Please try again.');
+    }
+  }
 
   function saveOrUpdateChat(device, updateFn) {
     if (!device?.endpointId) return;
@@ -157,6 +282,57 @@ export default function App() {
     });
   }
 
+  function saveGroupMessage(payload) {
+    const groupId = payload.groupId;
+    const senderName = payload.senderName || 'Nearby device';
+    const sentAt = Number(payload.sentAt) || Date.now();
+    if (typeof groupId !== 'string' || !groupId) return;
+
+    const message = {
+      id: payload.id || `group-${sentAt}-${Math.random()}`,
+      text: typeof payload.text === 'string' ? payload.text : '',
+      sentAt,
+      senderId: payload.senderId || '',
+      sender: 'them',
+      senderName,
+      status: 'received',
+    };
+    const receivedMembers = Array.isArray(payload.memberNames)
+      ? payload.memberNames.filter(member => typeof member === 'string' && member.trim())
+      : [];
+    const memberNames = [...new Set([...receivedMembers, senderName])];
+
+    setChats(previous => {
+      const existing = previous.find(chat => chat.kind === 'group' && chat.id === groupId);
+      const isNewMessage = !(existing?.messages || []).some(item => item.id === message.id);
+      const messages = isNewMessage
+        ? [...(existing?.messages || []), message]
+        : existing.messages;
+      const groupChat = {
+        ...existing,
+        id: groupId,
+        kind: 'group',
+        name: payload.groupName || existing?.name || 'Group chat',
+        initials: getInitials(payload.groupName || existing?.name || 'Group chat'),
+        color: existing?.color || '#386B64',
+        memberNames: [...new Set([...(existing?.memberNames || []), ...memberNames])],
+        messages,
+        message: message.text,
+        time: new Date(sentAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        unread: !isNewMessage || selectedChatRef.current?.id === groupId
+          ? 0
+          : (existing?.unread || 0) + 1,
+        updatedAt: sentAt,
+      };
+
+      return existing
+        ? previous.map(chat => chat.id === groupId && chat.kind === 'group' ? groupChat : chat)
+          .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
+        : [groupChat, ...previous].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    });
+    setNotice(`New group message from ${senderName}`);
+  }
+
   function getDeviceName(endpointId, fallback = 'Nearby device') {
     return connectedDevices.find(item => item.endpointId === endpointId)?.name
       || nearbyDevices.find(item => item.endpointId === endpointId)?.name
@@ -165,22 +341,75 @@ export default function App() {
       || fallback;
   }
 
+  function normalizeDeviceName(name = '') {
+    return name.trim().toLowerCase();
+  }
+
+  function isBlockedDevice(name) {
+    return blockedDevicesRef.current.has(normalizeDeviceName(name));
+  }
+
+  function saveBlockedDevices(nextBlockedDevices) {
+    blockedDevicesRef.current = nextBlockedDevices;
+    const saved = [...nextBlockedDevices.values()];
+    setBlockedDevices(saved);
+    AsyncStorage.setItem('@chathub/blocked-devices', JSON.stringify(saved))
+      .catch(error => console.warn('Could not save blocked devices:', error));
+  }
+
+  function blockDevice(endpointId, name, requestPending = false) {
+    if (!blockedDevicesLoadedRef.current) {
+      setNotice('Block list is still loading. Try again shortly.');
+      return;
+    }
+
+    const normalizedName = normalizeDeviceName(name);
+    if (!normalizedName) return;
+
+    const nextBlockedDevices = new Map(blockedDevicesRef.current);
+    nextBlockedDevices.set(normalizedName, { endpointId, name: name.trim() });
+    saveBlockedDevices(nextBlockedDevices);
+    setNearbyDevices(previous => previous.filter(device =>
+      normalizeDeviceName(device.name || device.endpointName) !== normalizedName
+    ));
+    setRequests(previous => previous.filter(request =>
+      normalizeDeviceName(request.name) !== normalizedName
+    ));
+
+    if (requestPending) {
+      nearby.rejectConnection(endpointId).catch(error => {
+        console.warn('Could not reject blocked connection request:', error);
+      });
+    }
+    setNotice(`${name} blocked on this phone`);
+  }
+
+  function unblockDevice(name) {
+    const nextBlockedDevices = new Map(blockedDevicesRef.current);
+    nextBlockedDevices.delete(normalizeDeviceName(name));
+    saveBlockedDevices(nextBlockedDevices);
+    setNotice(`${name} unblocked`);
+  }
+
   useEffect(() => {
     let subscriptions = [];
     let mounted = true;
+    let savedChats = [];
 
     AsyncStorage.getItem('@chathub/chats')
       .then(raw => {
         if (!mounted || !raw) return;
         try {
           const saved = JSON.parse(raw);
-          if (Array.isArray(saved)) setChats(saved);
+          if (Array.isArray(saved)) savedChats = saved;
         } catch (error) {
           console.warn('Could not restore chat history:', error);
         }
       })
       .catch(error => console.warn('Could not load chat history:', error))
       .finally(() => {
+        if (!mounted) return;
+        setChats(previous => mergeRestoredChats(savedChats, previous));
         chatsLoadedRef.current = true;
       });
 
@@ -189,6 +418,7 @@ export default function App() {
         subscriptions.push(
           nearby.addListener('deviceFound', device => {
             const name = device.endpointName || device.name || 'Nearby device';
+            if (isBlockedDevice(name)) return;
             setNearbyDevices(previous => {
               const exists = previous.some(item => item.endpointId === device.endpointId);
               const normalized = { ...device, name };
@@ -208,24 +438,26 @@ export default function App() {
         subscriptions.push(
           nearby.addListener('connectionRequest', request => {
             const name = request.endpointName || request.name || 'Nearby device';
-            if (request.isOutgoing) {
-              // Nearby Connections requires both endpoints to accept the initiated connection.
-              nearby.acceptConnection(request.endpointId).catch(error => {
-                console.warn('Could not accept outgoing connection handshake:', error);
-                setNotice(`Could not complete connection to ${name}`);
+            if (isBlockedDevice(name)) {
+              nearby.rejectConnection(request.endpointId).catch(error => {
+                console.warn('Could not reject blocked connection request:', error);
               });
               return;
             }
             setRequests(previous => {
-              if (previous.some(item => item.endpointId === request.endpointId)) return previous;
-              return [...previous, {
+              const pendingRequest = {
                 id: request.endpointId,
                 endpointId: request.endpointId,
                 name,
                 initials: getInitials(name),
-                detail: 'Wants to connect with you',
+                detail: 'Compare this code with the other device before accepting.',
+                authenticationToken: request.authenticationToken,
+                isOutgoing: Boolean(request.isOutgoing),
                 color: '#7558A6',
-              }];
+              };
+              return previous.some(item => item.endpointId === request.endpointId)
+                ? previous.map(item => item.endpointId === request.endpointId ? pendingRequest : item)
+                : [...previous, pendingRequest];
             });
           })
         );
@@ -266,6 +498,10 @@ export default function App() {
             } catch {
               payload = { text: rawMessage, id: `${Date.now()}-${Math.random()}`, sentAt: Date.now() };
             }
+            if (payload.type === 'group-message') {
+              saveGroupMessage(payload);
+              return;
+            }
             const text = typeof payload.text === 'string' ? payload.text : rawMessage;
             const endpointId = event.endpointId;
             const name = event.endpointName || getDeviceName(endpointId, 'Nearby device');
@@ -273,12 +509,14 @@ export default function App() {
               id: payload.id || `${Date.now()}-${Math.random()}`,
               text,
               sentAt: Number(payload.sentAt) || Date.now(),
+              senderId: payload.senderId || '',
               sender: 'them',
               senderName: payload.senderName || name,
               status: 'received',
             };
             saveOrUpdateChat({ endpointId, name }, chat => {
-              const messages = [...(chat.messages || []), message];
+              const isNewMessage = !(chat.messages || []).some(item => item.id === message.id);
+              const messages = isNewMessage ? [...(chat.messages || []), message] : chat.messages;
               return {
                 ...chat,
                 name,
@@ -286,11 +524,83 @@ export default function App() {
                 messages,
                 message: text,
                 time: new Date(message.sentAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-                unread: selectedChatRef.current?.endpointId === endpointId ? 0 : (chat.unread || 0) + 1,
+                unread: !isNewMessage || selectedChatRef.current?.endpointId === endpointId
+                  ? 0
+                  : (chat.unread || 0) + 1,
                 updatedAt: message.sentAt,
               };
             });
             setNotice(`New message from ${name}`);
+          })
+        );
+
+        subscriptions.push(
+          nearby.addListener('fileReceived', event => {
+            const endpointId = event.endpointId;
+            const name = event.endpointName || getDeviceName(endpointId, 'Nearby device');
+            const message = {
+              id: event.messageId || `file-${event.payloadId}`,
+              payloadId: event.payloadId,
+              senderId: event.senderId || '',
+              type: event.kind || 'file',
+              name: event.fileName || 'Shared file',
+              mimeType: event.mimeType || 'application/octet-stream',
+              uri: event.uri,
+              sentAt: Number(event.sentAt) || Date.now(),
+              sender: 'them',
+              senderName: event.senderName || name,
+              status: 'received',
+            };
+            saveOrUpdateChat({ endpointId, name }, chat => {
+              const isNewMessage = !(chat.messages || []).some(item => item.id === message.id);
+              const messages = isNewMessage ? [...(chat.messages || []), message] : chat.messages;
+              return {
+                ...chat,
+                name,
+                initials: getInitials(name),
+                messages,
+                message: message.type === 'audio' ? 'Voice message' : message.name,
+                time: new Date(message.sentAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                unread: !isNewMessage || selectedChatRef.current?.endpointId === endpointId
+                  ? 0
+                  : (chat.unread || 0) + 1,
+                updatedAt: message.sentAt,
+              };
+            });
+            setNotice(`Received ${message.name} from ${name}`);
+          })
+        );
+
+        subscriptions.push(
+          nearby.addListener('transferComplete', event => {
+            if (!event.messageId) return;
+            setChats(previous => previous.map(chat => ({
+              ...chat,
+              messages: (chat.messages || []).map(message => message.id === event.messageId
+                ? { ...message, status: 'sent' }
+                : message
+              ),
+            })));
+          })
+        );
+
+        subscriptions.push(
+          nearby.addListener('transferFailed', event => {
+            if (!event.messageId) return;
+            setChats(previous => previous.map(chat => ({
+              ...chat,
+              messages: (chat.messages || []).map(message => message.id === event.messageId
+                ? { ...message, status: 'failed' }
+                : message
+              ),
+            })));
+            setNotice('File transfer failed. Check the connection and retry.');
+          })
+        );
+
+        subscriptions.push(
+          nearby.addListener('fileTransferFailed', event => {
+            setNotice(event.message || 'Could not save the received file.');
           })
         );
       } catch (error) {
@@ -315,6 +625,70 @@ export default function App() {
     AsyncStorage.setItem('@chathub/chats', JSON.stringify(chats))
       .catch(error => console.warn('Could not save chat history:', error));
   }, [chats]);
+
+  useEffect(() => {
+    let mounted = true;
+
+    const loadProfileIdentity = async () => {
+      let savedId = '';
+      let savedName = '';
+      try {
+        [savedId, savedName] = await Promise.all([
+          AsyncStorage.getItem('@chathub/profile-id'),
+          AsyncStorage.getItem('@chathub/profile-name'),
+        ]);
+      } catch (error) {
+        console.warn('Could not load profile identity:', error);
+      }
+
+      const identity = savedId || Crypto.randomUUID();
+      if (!savedId) {
+        try {
+          await AsyncStorage.setItem('@chathub/profile-id', identity);
+        } catch (error) {
+          console.warn('Could not save profile ID:', error);
+        }
+      }
+      if (!mounted) return;
+
+      profileIdRef.current = identity;
+      setProfileId(identity);
+      if (savedName?.trim()) {
+        setProfileName(savedName.trim());
+      } else {
+        setProfileName(getGeneratedDisplayName(identity));
+        setProfileSetupName('');
+        setIsProfileSetupVisible(true);
+      }
+    };
+
+    loadProfileIdentity();
+
+    AsyncStorage.getItem('@chathub/blocked-devices')
+      .then(raw => {
+        if (!mounted || !raw) return;
+        try {
+          const saved = JSON.parse(raw);
+          if (Array.isArray(saved)) {
+            const validDevices = saved.filter(device => typeof device?.name === 'string' && device.name.trim());
+            blockedDevicesRef.current = new Map(
+              validDevices.map(device => [normalizeDeviceName(device.name), device])
+            );
+            setBlockedDevices([...blockedDevicesRef.current.values()]);
+          }
+        } catch (error) {
+          console.warn('Could not restore blocked devices:', error);
+        }
+      })
+      .catch(error => console.warn('Could not load blocked devices:', error))
+      .finally(() => {
+        blockedDevicesLoadedRef.current = true;
+      });
+
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   useEffect(() => {
     selectedChatRef.current = selectedChat;
@@ -353,6 +727,16 @@ export default function App() {
     return;
   }
 
+  if (!blockedDevicesLoadedRef.current) {
+    setNotice('Loading blocked devices. Try scanning again shortly.');
+    return;
+  }
+
+  if (!profileIdRef.current) {
+    setNotice('Setting up your profile. Try scanning again shortly.');
+    return;
+  }
+
   scanningRef.current = true;
   setIsScanning(true);
   setNotice('Searching for nearby devices...');
@@ -377,17 +761,21 @@ if (!granted) {
 
     await nearby.startDiscovery();
 
+    let advertisingStarted = true;
     try {
-      await nearby.startAdvertising(profileName || 'ChatHub');
+      await nearby.startAdvertising(getPublicDisplayName());
     } catch (advertisingError) {
       console.warn('Advertising start error:', advertisingError);
 
       // Discovery may still be running, but this phone will not be discoverable.
+      advertisingStarted = false;
       setNotice('Search started, but other phones may not discover this device.');
 
     }
 
-    setNotice('Searching for nearby devices...');
+    if (advertisingStarted) {
+      setNotice('Searching for nearby devices...');
+    }
   } catch (error) {
     console.warn('Start scanning error:', error);
 
@@ -416,13 +804,17 @@ if (!granted) {
 }
   async function connectToDevice(device) {
     try {
+      if (!profileIdRef.current) {
+        setNotice('Setting up your profile. Try connecting again shortly.');
+        return;
+      }
       if (!device?.endpointId) {
         setNotice('Device ID is missing');
         return;
       }
 
       const deviceName = device.name || device.endpointName || 'Nearby device';
-      await nearby.requestConnection(device.endpointId, deviceName);
+      await nearby.requestConnection(device.endpointId, getPublicDisplayName());
       saveOrUpdateChat({ ...device, name: deviceName }, chat => ({
         ...chat, name: deviceName, initials: getInitials(deviceName), updatedAt: Date.now()
       }));
@@ -434,6 +826,11 @@ if (!granted) {
   }
 
   async function acceptRequest(request) {
+    if (!request.authenticationToken) {
+      setNotice('Verification code is unavailable. Do not accept this connection.');
+      return;
+    }
+
     try {
       await nearby.acceptConnection(request.endpointId);
 
@@ -481,6 +878,16 @@ if (!granted) {
   }
 
   function openChat(chat) {
+    if (chat.kind === 'group') {
+      const latest = chats.find(item => item.kind === 'group' && item.id === chat.id) || chat;
+      setSelectedChat(latest);
+      setChats(previous => previous.map(item =>
+        item.kind === 'group' && item.id === chat.id ? { ...item, unread: 0 } : item
+      ));
+      setMessageDraft('');
+      return;
+    }
+
     const latest = chats.find(item => item.endpointId === chat.endpointId) || chat;
     setSelectedChat(latest);
     setChats(previous => previous.map(item =>
@@ -490,13 +897,354 @@ if (!granted) {
   }
 
   function closeChat() {
+    if (isRecordingVoice) {
+      setNotice('Stop the voice recording before leaving this chat.');
+      return;
+    }
     setSelectedChat(null);
     setMessageDraft('');
   }
 
+  function getGroupRecipients(group) {
+    const memberNames = new Set((group.memberNames || []).map(normalizeDeviceName));
+    return connectedDevices.filter(device => memberNames.has(normalizeDeviceName(device.name)));
+  }
+
+  function createGroupChat() {
+    const groupName = newGroupName.trim();
+    const members = connectedDevices.filter(device => selectedGroupMembers.includes(device.endpointId));
+    if (!groupName) {
+      setNotice('Enter a name for the group.');
+      return;
+    }
+    if (members.length === 0) {
+      setNotice('Select at least one connected device.');
+      return;
+    }
+
+    const memberNames = [...new Set([getPublicDisplayName(), ...members.map(device => device.name)])];
+    const group = {
+      id: `group-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      kind: 'group',
+      name: groupName,
+      initials: getInitials(groupName),
+      color: '#386B64',
+      memberNames,
+      messages: [],
+      message: `${memberNames.length} members`,
+      time: '',
+      unread: 0,
+      updatedAt: Date.now(),
+    };
+    setChats(previous => [group, ...previous]);
+    setIsGroupModalOpen(false);
+    setNewGroupName('');
+    setSelectedGroupMembers([]);
+    setSelectedChat(group);
+    setMessageDraft('');
+    setNotice(`Group ${groupName} created`);
+  }
+
+  async function sendGroupChatMessage(text) {
+    const group = chats.find(item => item.kind === 'group' && item.id === selectedChat?.id) || selectedChat;
+    const recipients = getGroupRecipients(group);
+    if (recipients.length === 0) {
+      setNotice('No group members are connected right now.');
+      return;
+    }
+
+    const sentAt = Date.now();
+    const message = {
+      id: `${sentAt}-${Math.random().toString(36).slice(2, 9)}`,
+      text,
+      sentAt,
+      sender: 'me',
+      senderName: getPublicDisplayName(),
+      senderId: profileId,
+      status: 'sending',
+    };
+    setMessageDraft('');
+    setChats(previous => previous.map(chat => chat.kind === 'group' && chat.id === group.id
+      ? {
+          ...chat,
+          messages: [...(chat.messages || []), message],
+          message: text,
+          time: new Date(sentAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          updatedAt: sentAt,
+        }
+      : chat
+    ));
+
+    const payload = JSON.stringify({
+      type: 'group-message',
+      groupId: group.id,
+      groupName: group.name,
+      memberNames: group.memberNames,
+      id: message.id,
+      text,
+      sentAt,
+      senderName: message.senderName,
+      senderId: message.senderId,
+    });
+    const results = await Promise.allSettled(recipients.map(device =>
+      nearby.sendMessage(device.endpointId, payload)
+    ));
+    const succeeded = results.filter(result => result.status === 'fulfilled').length;
+    const status = succeeded === recipients.length ? 'sent' : succeeded > 0 ? 'partial' : 'failed';
+    setChats(previous => previous.map(chat => chat.kind === 'group' && chat.id === group.id
+      ? {
+          ...chat,
+          messages: (chat.messages || []).map(item => item.id === message.id ? { ...item, status } : item),
+        }
+      : chat
+    ));
+    if (status !== 'sent') {
+      setNotice(status === 'partial'
+        ? `Message reached ${succeeded} of ${recipients.length} connected group members.`
+        : 'Message could not be sent to the group.');
+    }
+  }
+
+  async function transmitChatMessage(endpointId, message) {
+    const connected = connectedDevices.some(device => device.endpointId === endpointId);
+    if (!connected) {
+      setNotice('Reconnect to this device before retrying the message.');
+      return;
+    }
+
+    setChats(previous => previous.map(chat => chat.endpointId === endpointId
+      ? { ...chat, messages: (chat.messages || []).map(item => item.id === message.id ? { ...item, status: 'sending' } : item) }
+      : chat
+    ));
+
+    try {
+      await nearby.sendMessage(endpointId, JSON.stringify({
+        id: message.id,
+        text: message.text,
+        sentAt: message.sentAt,
+        senderName: message.senderName || getPublicDisplayName(),
+        senderId: message.senderId || profileId,
+      }));
+      setChats(previous => previous.map(chat => chat.endpointId === endpointId
+        ? { ...chat, messages: (chat.messages || []).map(item => item.id === message.id ? { ...item, status: 'sent' } : item) }
+        : chat
+      ));
+    } catch (error) {
+      console.warn('Message send failed:', error);
+      setChats(previous => previous.map(chat => chat.endpointId === endpointId
+        ? { ...chat, messages: (chat.messages || []).map(item => item.id === message.id ? { ...item, status: 'failed' } : item) }
+        : chat
+      ));
+      setNotice('Message could not be sent. Check the connection and retry.');
+    }
+  }
+
+  async function transmitChatFile(endpointId, message) {
+    const connected = connectedDevices.some(device => device.endpointId === endpointId);
+    if (!connected || !message.uri) {
+      setNotice(connected ? 'This file is no longer available to retry.' : 'Reconnect before retrying this file.');
+      return;
+    }
+
+    setChats(previous => previous.map(chat => chat.endpointId === endpointId
+      ? { ...chat, messages: (chat.messages || []).map(item => item.id === message.id ? { ...item, status: 'sending' } : item) }
+      : chat
+    ));
+
+    try {
+      const payloadId = await nearby.sendFile(
+        endpointId,
+        message.uri,
+        message.id,
+        message.name,
+        message.mimeType || 'application/octet-stream',
+        message.type,
+        message.sentAt,
+        message.senderName || getPublicDisplayName(),
+        message.senderId || profileId
+      );
+      setChats(previous => previous.map(chat => chat.endpointId === endpointId
+        ? { ...chat, messages: (chat.messages || []).map(item => item.id === message.id ? { ...item, payloadId } : item) }
+        : chat
+      ));
+    } catch (error) {
+      console.warn('File transfer failed:', error);
+      setChats(previous => previous.map(chat => chat.endpointId === endpointId
+        ? { ...chat, messages: (chat.messages || []).map(item => item.id === message.id ? { ...item, status: 'failed' } : item) }
+        : chat
+      ));
+      setNotice(error?.code === 'FILE_TOO_LARGE'
+        ? 'Files must be 100 MB or smaller.'
+        : 'File transfer failed. Check the connection and retry.');
+    }
+  }
+
+  async function sendChatAttachment(attachment) {
+    const endpointId = selectedChat?.endpointId;
+    if (!endpointId || !connectedDevices.some(device => device.endpointId === endpointId)) {
+      setNotice('Connect to this device before sending attachments.');
+      return;
+    }
+
+    const sentAt = Date.now();
+    const message = {
+      id: `${sentAt}-${Math.random().toString(36).slice(2, 9)}`,
+      ...attachment,
+      sentAt,
+      sender: 'me',
+      senderName: getPublicDisplayName(),
+      senderId: profileId,
+      status: 'sending',
+    };
+    setChats(previous => previous.map(chat => chat.endpointId === endpointId
+      ? {
+          ...chat,
+          messages: [...(chat.messages || []), message],
+          message: message.type === 'audio' ? 'Voice message' : message.name,
+          time: new Date(sentAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          unread: 0,
+          updatedAt: sentAt,
+        }
+      : chat
+    ));
+    await transmitChatFile(endpointId, message);
+  }
+
+  async function pickChatFile() {
+    try {
+      const result = await DocumentPicker.getDocumentAsync({
+        copyToCacheDirectory: true,
+        type: '*/*',
+      });
+      if (result.canceled || !result.assets?.[0]) return;
+
+      const asset = result.assets[0];
+      if ((asset.size || 0) > 100 * 1024 * 1024) {
+        setNotice('Choose a file that is 100 MB or smaller.');
+        return;
+      }
+
+      await sendChatAttachment({
+        uri: asset.uri,
+        name: asset.name,
+        mimeType: asset.mimeType || 'application/octet-stream',
+        type: asset.mimeType?.startsWith('image/') ? 'image' : 'file',
+      });
+    } catch (error) {
+      console.warn('Could not select file:', error);
+      setNotice('Could not open the file picker.');
+    }
+  }
+
+  async function toggleVoiceRecording() {
+    if (isRecordingVoice) {
+      try {
+        await audioRecorder.stop();
+        setIsRecordingVoice(false);
+        await setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true });
+        const uri = audioRecorder.uri;
+        if (!uri) {
+          setNotice('Voice recording was not saved.');
+          return;
+        }
+        const fileName = uri.split('/').pop() || `voice-${Date.now()}.m4a`;
+        const mimeType = fileName.toLowerCase().endsWith('.3gp') ? 'audio/3gpp' : 'audio/mp4';
+        await sendChatAttachment({ uri, name: fileName, mimeType, type: 'audio' });
+      } catch (error) {
+        console.warn('Could not finish voice recording:', error);
+        setIsRecordingVoice(false);
+        setNotice('Could not finish voice recording.');
+      }
+      return;
+    }
+
+    if (!selectedChat?.endpointId || !connectedDevices.some(device => device.endpointId === selectedChat.endpointId)) {
+      setNotice('Connect to this device before recording a voice message.');
+      return;
+    }
+
+    try {
+      const permission = await AudioModule.requestRecordingPermissionsAsync();
+      if (!permission.granted) {
+        setNotice('Microphone permission is required for voice messages.');
+        return;
+      }
+      await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
+      await audioRecorder.prepareToRecordAsync();
+      audioRecorder.record();
+      setIsRecordingVoice(true);
+    } catch (error) {
+      console.warn('Could not start voice recording:', error);
+      setNotice('Could not start voice recording. Check microphone permission.');
+    }
+  }
+
+  async function shareChatFile(message) {
+    if (!message.uri) {
+      setNotice('This file is no longer available on this phone.');
+      return;
+    }
+    try {
+      if (!(await Sharing.isAvailableAsync())) {
+        setNotice('File sharing is not available on this device.');
+        return;
+      }
+      await Sharing.shareAsync(message.uri, {
+        mimeType: message.mimeType,
+        dialogTitle: message.name || 'Share file',
+      });
+    } catch (error) {
+      console.warn('Could not share file:', error);
+      setNotice('Could not open the system share menu.');
+    }
+  }
+
+  function retryChatMessage(endpointId, message) {
+    if (message.status === 'failed') {
+      if (message.type && message.uri) {
+        transmitChatFile(endpointId, message);
+      } else {
+        transmitChatMessage(endpointId, message);
+      }
+    }
+  }
+
+  function deleteChatMessage(endpointId, messageId) {
+    Alert.alert(
+      'Delete this message?',
+      'This removes it from this phone only. The other person may still have it.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: () => setChats(previous => previous.map(chat => {
+            if (chat.endpointId !== endpointId) return chat;
+            const messages = (chat.messages || []).filter(message => message.id !== messageId);
+            const latestMessage = messages[messages.length - 1];
+            return {
+              ...chat,
+              messages,
+              message: latestMessage?.text || 'No messages yet',
+              time: latestMessage
+                ? new Date(latestMessage.sentAt || Date.now()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                : '',
+              updatedAt: latestMessage?.sentAt || 0,
+            };
+          }).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))),
+        },
+      ]
+    );
+  }
+
   async function sendChatMessage() {
     const text = messageDraft.trim();
-    if (!text || !selectedChat?.endpointId) return;
+    if (!text || !selectedChat) return;
+    if (selectedChat.kind === 'group') {
+      await sendGroupChatMessage(text);
+      return;
+    }
+    if (!selectedChat.endpointId) return;
     const connected = connectedDevices.some(device => device.endpointId === selectedChat.endpointId);
     if (!connected) {
       setNotice('Connect to this device before sending messages.');
@@ -509,7 +1257,8 @@ if (!granted) {
       text,
       sentAt,
       sender: 'me',
-      senderName: profileName || 'ChatHub User',
+      senderName: getPublicDisplayName(),
+      senderId: profileId,
       status: 'sending',
     };
     setMessageDraft('');
@@ -524,26 +1273,7 @@ if (!granted) {
         }
       : chat
     ));
-
-    try {
-      await nearby.sendMessage(selectedChat.endpointId, JSON.stringify({
-        id: message.id,
-        text,
-        sentAt,
-        senderName: profileName || 'ChatHub User',
-      }));
-      setChats(previous => previous.map(chat => chat.endpointId === selectedChat.endpointId
-        ? { ...chat, messages: (chat.messages || []).map(item => item.id === message.id ? { ...item, status: 'sent' } : item) }
-        : chat
-      ));
-    } catch (error) {
-      console.warn('Message send failed:', error);
-      setChats(previous => previous.map(chat => chat.endpointId === selectedChat.endpointId
-        ? { ...chat, messages: (chat.messages || []).map(item => item.id === message.id ? { ...item, status: 'failed' } : item) }
-        : chat
-      ));
-      setNotice('Message could not be sent. Check the connection and retry.');
-    }
+    await transmitChatMessage(selectedChat.endpointId, message);
   }
 
   function renderHeader() {
@@ -1028,13 +1758,24 @@ if (!granted) {
                     </Text>
                   </View>
                 ) : (
-                  <TouchableOpacity
-                    style={styles.connectButton}
-                    onPress={() => connectToDevice(device)}
-                    activeOpacity={0.8}
-                  >
-                    <Text style={styles.connectButtonText}>Connect</Text>
-                  </TouchableOpacity>
+                  <View style={styles.nearbyDeviceActions}>
+                    <TouchableOpacity
+                      style={styles.connectButton}
+                      onPress={() => connectToDevice(device)}
+                      activeOpacity={0.8}
+                    >
+                      <Text style={styles.connectButtonText}>Connect</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={styles.deviceBlockButton}
+                      accessibilityRole="button"
+                      accessibilityLabel={`Block ${deviceName}`}
+                      onPress={() => blockDevice(device.endpointId, deviceName)}
+                      activeOpacity={0.8}
+                    >
+                      <Ionicons name="ban-outline" size={17} color="#FF9B9B" />
+                    </TouchableOpacity>
+                  </View>
                 )}
               </View>
             );
@@ -1074,6 +1815,12 @@ if (!granted) {
   }
 
   function renderChats() {
+    const matchingChats = chats.filter(chat =>
+      (chat.name || 'Nearby device').toLowerCase().includes(searchQuery.toLowerCase())
+    );
+    const groupChats = matchingChats.filter(chat => chat.kind === 'group');
+    const directChats = matchingChats.filter(chat => chat.kind !== 'group');
+
     return (
       <ScrollView
         showsVerticalScrollIndicator={false}
@@ -1107,16 +1854,22 @@ if (!granted) {
               {chats.length} conversation{chats.length === 1 ? '' : 's'}
             </Text>
           </View>
+          <TouchableOpacity
+            style={styles.newGroupButton}
+            accessibilityRole="button"
+            accessibilityLabel="Create a group chat"
+            onPress={() => setIsGroupModalOpen(true)}
+            activeOpacity={0.8}
+          >
+            <Ionicons name="add" size={18} color={COLORS.text} />
+            <Text style={styles.newGroupButtonText}>New group</Text>
+          </TouchableOpacity>
         </View>
 
-        {chats.filter(chat =>
-          (chat.name || 'Nearby device').toLowerCase().includes(searchQuery.toLowerCase())
-        ).length > 0 ? (
-          chats
-            .filter(chat =>
-              (chat.name || 'Nearby device').toLowerCase().includes(searchQuery.toLowerCase())
-            )
-            .map(chat => (
+        {groupChats.length > 0 ? (
+          <>
+            <SectionTitle title="Groups" />
+            {groupChats.map(chat => (
               <TouchableOpacity
                 key={chat.id}
                 style={styles.chatRow}
@@ -1124,9 +1877,9 @@ if (!granted) {
                 activeOpacity={0.75}
               >
                 <Avatar
-                  initials={chat.initials}
+                  initials={chat.initials || getInitials(chat.name)}
                   color={chat.color}
-                  online={chat.online}
+                  online={getGroupRecipients(chat).length > 0}
                 />
 
                 <View style={styles.chatInfo}>
@@ -1136,7 +1889,7 @@ if (!granted) {
                   </View>
 
                   <Text style={styles.chatPreview} numberOfLines={1}>
-                    {chat.message}
+                    {chat.message || `${chat.memberNames?.length || 1} members`}
                   </Text>
                 </View>
 
@@ -1148,11 +1901,38 @@ if (!granted) {
                   </View>
                 )}
               </TouchableOpacity>
-            ))
+            ))}
+          </>
+        ) : null}
+
+        <SectionTitle title="Direct chats" />
+        {directChats.length > 0 ? (
+          directChats.map(chat => (
+            <TouchableOpacity
+              key={chat.id}
+              style={styles.chatRow}
+              onPress={() => openChat(chat)}
+              activeOpacity={0.75}
+            >
+              <Avatar initials={chat.initials} color={chat.color} online={chat.online} />
+              <View style={styles.chatInfo}>
+                <View style={styles.chatNameRow}>
+                  <Text style={styles.chatName}>{chat.name}</Text>
+                  <Text style={styles.chatTime}>{chat.time}</Text>
+                </View>
+                <Text style={styles.chatPreview} numberOfLines={1}>{chat.message}</Text>
+              </View>
+              {chat.unread > 0 ? (
+                <View style={styles.unreadBadge}>
+                  <Text style={styles.unreadBadgeText}>{chat.unread}</Text>
+                </View>
+              ) : null}
+            </TouchableOpacity>
+          ))
         ) : (
           <EmptyState
             icon="chatbubbles-outline"
-            title="No conversations found"
+            title={searchQuery ? 'No conversations found' : 'No direct chats yet'}
             description="Connect with a nearby device to get started."
           />
         )}
@@ -1168,6 +1948,77 @@ if (!granted) {
             Chat history is saved on this phone. Messages are sent directly to connected nearby ChatHub devices.
           </Text>
         </View>
+
+        <Modal
+          visible={isGroupModalOpen}
+          transparent
+          animationType="slide"
+          onRequestClose={() => setIsGroupModalOpen(false)}
+        >
+          <View style={styles.groupModalBackdrop}>
+            <View style={styles.groupModal}>
+              <View style={styles.groupModalHeader}>
+                <Text style={styles.groupModalTitle}>New group chat</Text>
+                <IconButton name="close" onPress={() => setIsGroupModalOpen(false)} />
+              </View>
+              <TextInput
+                style={styles.groupNameInput}
+                value={newGroupName}
+                onChangeText={setNewGroupName}
+                placeholder="Group name"
+                placeholderTextColor={COLORS.muted}
+                maxLength={40}
+                autoFocus
+              />
+              <Text style={styles.groupMemberHeading}>Connected devices</Text>
+              {connectedDevices.length > 0 ? (
+                <ScrollView style={styles.groupMemberList}>
+                  {connectedDevices.map(device => {
+                    const selected = selectedGroupMembers.includes(device.endpointId);
+                    return (
+                      <TouchableOpacity
+                        key={device.endpointId}
+                        style={[styles.groupMemberOption, selected && styles.groupMemberOptionSelected]}
+                        onPress={() => setSelectedGroupMembers(previous => selected
+                          ? previous.filter(id => id !== device.endpointId)
+                          : [...previous, device.endpointId]
+                        )}
+                        activeOpacity={0.75}
+                      >
+                        <Avatar initials={device.initials || getInitials(device.name)} color={device.color} size={36} online />
+                        <Text style={styles.groupMemberName}>{device.name}</Text>
+                        <Ionicons
+                          name={selected ? 'checkbox' : 'square-outline'}
+                          size={21}
+                          color={selected ? COLORS.green : COLORS.muted}
+                        />
+                      </TouchableOpacity>
+                    );
+                  })}
+                </ScrollView>
+              ) : (
+                <Text style={styles.groupNoMembers}>Connect to at least one device before creating a group.</Text>
+              )}
+              <View style={styles.groupModalActions}>
+                <TouchableOpacity
+                  style={styles.groupCancelButton}
+                  onPress={() => setIsGroupModalOpen(false)}
+                  activeOpacity={0.8}
+                >
+                  <Text style={styles.groupCancelButtonText}>Cancel</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.groupCreateButton, (!newGroupName.trim() || selectedGroupMembers.length === 0) && styles.groupCreateButtonDisabled]}
+                  onPress={createGroupChat}
+                  disabled={!newGroupName.trim() || selectedGroupMembers.length === 0}
+                  activeOpacity={0.8}
+                >
+                  <Text style={styles.groupCreateButtonText}>Create group</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        </Modal>
       </ScrollView>
     );
   }
@@ -1247,6 +2098,15 @@ if (!granted) {
                 </View>
               </View>
 
+              {request.authenticationToken ? (
+                <View style={styles.requestAuthCodeContainer}>
+                  <Text style={styles.requestAuthCodeLabel}>COMPARE CODE ON BOTH DEVICES</Text>
+                  <Text style={styles.requestAuthCode}>{request.authenticationToken}</Text>
+                </View>
+              ) : (
+                <Text style={styles.requestAuthCodeMissing}>Verification code unavailable. Do not accept.</Text>
+              )}
+
               <View style={styles.requestActions}>
                 <TouchableOpacity
                   style={styles.acceptButton}
@@ -1274,6 +2134,15 @@ if (!granted) {
                   />
 
                   <Text style={styles.rejectButtonText}>Decline</Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={styles.blockButton}
+                  onPress={() => blockDevice(request.endpointId, request.name, true)}
+                  activeOpacity={0.8}
+                >
+                  <Ionicons name="ban-outline" size={16} color="#FF9B9B" />
+                  <Text style={styles.blockButtonText}>Block</Text>
                 </TouchableOpacity>
               </View>
             </View>
@@ -1319,7 +2188,7 @@ if (!granted) {
           <View style={styles.profileAvatarWrapper}>
             <View style={styles.profileAvatar}>
               <Text style={styles.profileAvatarText}>
-                {getInitials(profileName || 'A')}
+                {getInitials(profileName || 'U')}
               </Text>
             </View>
 
@@ -1336,7 +2205,10 @@ if (!granted) {
             <TextInput
               style={styles.profileNameInput}
               value={profileName}
-              onChangeText={setProfileName}
+              onChangeText={name => {
+                profileNameDirtyRef.current = true;
+                setProfileName(name);
+              }}
               placeholder="Enter your name"
               placeholderTextColor={COLORS.muted}
               maxLength={30}
@@ -1352,13 +2224,23 @@ if (!granted) {
             ChatHub member
           </Text>
 
+          <View style={styles.profileIdBlock}>
+            <Text style={styles.profileIdLabel}>UNIQUE USER ID</Text>
+            <Text selectable style={styles.profileIdValue}>{getFullProfileId()}</Text>
+            <Text style={styles.profileIdHint}>Saved on this phone; it stays the same if your name changes.</Text>
+          </View>
+
           <TouchableOpacity
             style={styles.editProfileButton}
             onPress={() => {
               if (isEditingProfile) {
-                setProfileName(profileName.trim() || 'Amit');
                 setIsEditingProfile(false);
-                setNotice('Profile name updated for this session');
+                persistProfileName(profileName)
+                  .then(savedName => setNotice(`Profile name saved as ${savedName}`))
+                  .catch(error => {
+                    console.warn('Could not save profile name:', error);
+                    setNotice('Could not save profile name');
+                  });
               } else {
                 setIsEditingProfile(true);
               }
@@ -1519,6 +2401,37 @@ if (!granted) {
           </TouchableOpacity>
         </View>
 
+        <SectionTitle title={`Blocked devices (${blockedDevices.length})`} />
+        {blockedDevices.length > 0 ? (
+          <View style={styles.blockedDevicesList}>
+            {blockedDevices.map(device => (
+              <View key={normalizeDeviceName(device.name)} style={styles.blockedDeviceRow}>
+                <View style={styles.settingIcon}>
+                  <Ionicons name="ban-outline" size={19} color="#FF9B9B" />
+                </View>
+                <View style={styles.settingContent}>
+                  <Text style={styles.settingTitle}>{device.name}</Text>
+                  <Text style={styles.settingDescription}>Blocked by displayed name</Text>
+                </View>
+                <TouchableOpacity
+                  style={styles.unblockButton}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Unblock ${device.name}`}
+                  onPress={() => unblockDevice(device.name)}
+                  activeOpacity={0.8}
+                >
+                  <Text style={styles.unblockButtonText}>Unblock</Text>
+                </TouchableOpacity>
+              </View>
+            ))}
+            <Text style={styles.blockedDevicesNote}>
+              Devices with the same displayed name are blocked together. A device can change its name.
+            </Text>
+          </View>
+        ) : (
+          <Text style={styles.blockedDevicesEmpty}>No blocked devices.</Text>
+        )}
+
         <View style={styles.profileFooter}>
           <Ionicons
             name="chatbubbles"
@@ -1540,8 +2453,16 @@ if (!granted) {
 
   function renderChatScreen() {
     if (!selectedChat) return null;
-    const liveChat = chats.find(chat => chat.endpointId === selectedChat.endpointId) || selectedChat;
-    const connected = connectedDevices.some(device => device.endpointId === liveChat.endpointId);
+    const isGroupChat = selectedChat.kind === 'group';
+    const liveChat = chats.find(chat => isGroupChat
+      ? chat.kind === 'group' && chat.id === selectedChat.id
+      : chat.endpointId === selectedChat.endpointId
+    ) || selectedChat;
+    const groupRecipients = isGroupChat ? getGroupRecipients(liveChat) : [];
+    const connected = isGroupChat
+      ? groupRecipients.length > 0
+      : connectedDevices.some(device => device.endpointId === liveChat.endpointId);
+    const groupMemberCount = Math.max(0, (liveChat.memberNames || []).length - 1);
     const messages = liveChat.messages || [];
 
     return (
@@ -1556,7 +2477,11 @@ if (!granted) {
           />
           <View style={styles.chatScreenHeaderInfo}>
             <Text style={styles.chatScreenName}>{liveChat.name || 'Nearby device'}</Text>
-            <Text style={styles.chatScreenStatus}>{connected ? 'Connected • Offline messaging' : 'Not connected'}</Text>
+            <Text style={styles.chatScreenStatus}>
+              {isGroupChat
+                ? `Text group · ${groupRecipients.length}/${groupMemberCount} members nearby`
+                : connected ? 'Connected • Offline messaging' : 'Not connected'}
+            </Text>
           </View>
           <IconButton
             name="ellipsis-vertical"
@@ -1582,7 +2507,7 @@ if (!granted) {
                 icon="chatbubble-ellipses-outline"
                 title="Start a conversation"
                 description={connected
-                  ? 'You are connected. Send your first message below.'
+                  ? isGroupChat ? 'Send a message to the group below.' : 'You are connected. Send your first message below.'
                   : 'Connect to this device in Nearby before sending a message.'}
               />
             ) : messages.map(message => (
@@ -1594,20 +2519,72 @@ if (!granted) {
                 ]}
               >
                 <View style={[
+                  styles.messageBubbleColumn,
+                  message.sender === 'me' ? styles.messageBubbleColumnMine : styles.messageBubbleColumnTheirs,
+                ]}>
+                <View style={[
                   styles.messageBubble,
                   message.sender === 'me' ? styles.messageBubbleMine : styles.messageBubbleTheirs,
                 ]}>
-                  <Text style={styles.messageText}>{message.text}</Text>
+                  {message.type === 'image' && message.uri ? (
+                    <Image source={{ uri: message.uri }} style={styles.messageImage} resizeMode="cover" />
+                  ) : message.type === 'audio' ? (
+                    <VoiceMessage uri={message.uri} />
+                  ) : message.type === 'file' ? (
+                    <View style={styles.sharedFilePreview}>
+                      <Ionicons name="document-text-outline" size={22} color={COLORS.primary} />
+                      <View style={styles.sharedFileInfo}>
+                        <Text style={styles.sharedFileName} numberOfLines={2}>{message.name || 'Shared file'}</Text>
+                        <Text style={styles.sharedFileType} numberOfLines={1}>{message.mimeType || 'File'}</Text>
+                      </View>
+                    </View>
+                  ) : (
+                    <Text style={styles.messageText}>{message.text}</Text>
+                  )}
                   <View style={styles.messageMeta}>
                     <Text style={styles.messageTime}>
                       {new Date(message.sentAt || Date.now()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                     </Text>
                     {message.sender === 'me' ? (
-                      <Text style={styles.messageStatus}>
-                        {message.status === 'failed' ? 'Failed' : message.status === 'sending' ? 'Sending…' : 'Sent'}
+                      <Text style={[styles.messageStatus, message.status === 'partial' && styles.messageStatusPartial]}>
+                        {message.status === 'failed' ? 'Failed' : message.status === 'partial' ? 'Partial' : message.status === 'sending' ? 'Sending…' : 'Sent'}
                       </Text>
                     ) : null}
                   </View>
+                </View>
+                <View style={styles.messageActions}>
+                  {message.type && message.uri ? (
+                    <TouchableOpacity
+                      style={styles.messageActionButton}
+                      accessibilityRole="button"
+                      accessibilityLabel={`Share ${message.name || 'attachment'}`}
+                      onPress={() => shareChatFile(message)}
+                      activeOpacity={0.7}
+                    >
+                      <Ionicons name="share-outline" size={15} color={COLORS.primary} />
+                    </TouchableOpacity>
+                  ) : null}
+                  {message.sender === 'me' && message.status === 'failed' ? (
+                    <TouchableOpacity
+                      style={styles.messageActionButton}
+                      accessibilityRole="button"
+                      accessibilityLabel="Retry sending message"
+                      onPress={() => retryChatMessage(liveChat.endpointId, message)}
+                      activeOpacity={0.7}
+                    >
+                      <Ionicons name="refresh" size={15} color={COLORS.primary} />
+                    </TouchableOpacity>
+                  ) : null}
+                  <TouchableOpacity
+                    style={styles.messageActionButton}
+                    accessibilityRole="button"
+                    accessibilityLabel="Delete message from this phone"
+                    onPress={() => deleteChatMessage(liveChat.endpointId, message.id)}
+                    activeOpacity={0.7}
+                  >
+                    <Ionicons name="trash-outline" size={15} color={COLORS.muted} />
+                  </TouchableOpacity>
+                </View>
                 </View>
               </View>
             ))}
@@ -1615,14 +2592,38 @@ if (!granted) {
         </View>
 
         <View style={styles.chatComposer}>
+          <TouchableOpacity
+            style={styles.chatToolButton}
+            accessibilityRole="button"
+            accessibilityLabel="Attach a file"
+            onPress={pickChatFile}
+            disabled={!connected || isRecordingVoice || isGroupChat}
+            activeOpacity={0.75}
+          >
+            <Ionicons name="attach-outline" size={20} color={connected && !isGroupChat ? COLORS.muted : COLORS.border} />
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.chatToolButton, isRecordingVoice && styles.chatToolButtonRecording]}
+            accessibilityRole="button"
+            accessibilityLabel={isRecordingVoice ? 'Stop recording voice message' : 'Record voice message'}
+            onPress={toggleVoiceRecording}
+            disabled={(!connected || isGroupChat) && !isRecordingVoice}
+            activeOpacity={0.75}
+          >
+            <Ionicons
+              name={isRecordingVoice ? 'stop' : 'mic-outline'}
+              size={18}
+              color={isRecordingVoice ? '#FF9B9B' : connected && !isGroupChat ? COLORS.muted : COLORS.border}
+            />
+          </TouchableOpacity>
           <View style={styles.chatComposerInput}>
             <TextInput
               style={styles.chatComposerText}
-              placeholder={connected ? 'Write a message…' : 'Connect to send messages'}
+              placeholder={isRecordingVoice ? 'Recording voice message…' : isGroupChat ? 'Write a group message…' : connected ? 'Write a message…' : 'Connect to send messages'}
               placeholderTextColor={COLORS.muted}
               value={messageDraft}
               onChangeText={setMessageDraft}
-              editable={connected}
+              editable={connected && !isRecordingVoice}
               multiline
               maxLength={4000}
               returnKeyType="send"
@@ -1774,6 +2775,53 @@ if (!granted) {
       {!selectedChat && renderBottomNavigation()}
 
       {renderNotice()}
+
+      <Modal
+        visible={isProfileSetupVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => {}}
+      >
+        <View style={styles.profileSetupBackdrop}>
+          <View style={styles.profileSetupModal}>
+            <View style={styles.profileSetupIcon}>
+              <Ionicons name="person-add-outline" size={24} color={COLORS.text} />
+            </View>
+            <Text style={styles.profileSetupTitle}>Set up your profile</Text>
+            <Text style={styles.profileSetupDescription}>
+              Choose a name, or use your generated ID as your display name. Your unique ID stays the same either way.
+            </Text>
+            <TextInput
+              style={styles.profileSetupInput}
+              value={profileSetupName}
+              onChangeText={setProfileSetupName}
+              placeholder="Your name"
+              placeholderTextColor={COLORS.muted}
+              maxLength={30}
+              autoCapitalize="words"
+              autoFocus
+            />
+            <View style={styles.profileSetupActions}>
+              <TouchableOpacity
+                style={styles.profileSetupGeneratedButton}
+                onPress={() => finishProfileSetup(getGeneratedDisplayName(profileId))}
+                activeOpacity={0.8}
+              >
+                <Text style={styles.profileSetupGeneratedText}>{getGeneratedDisplayName(profileId)}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.profileSetupSaveButton, !profileSetupName.trim() && styles.profileSetupSaveButtonDisabled]}
+                onPress={() => finishProfileSetup(profileSetupName)}
+                disabled={!profileSetupName.trim()}
+                activeOpacity={0.8}
+              >
+                <Text style={styles.profileSetupSaveText}>Save name</Text>
+              </TouchableOpacity>
+            </View>
+            <Text style={styles.profileSetupId}>ID: {getFullProfileId()}</Text>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );}
   const styles = StyleSheet.create({
@@ -2468,6 +3516,19 @@ if (!granted) {
     fontWeight: '800',
   },
 
+  nearbyDeviceActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+
+  deviceBlockButton: {
+    width: 36,
+    height: 36,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginLeft: 4,
+  },
+
   connectedPill: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -2575,6 +3636,145 @@ if (!granted) {
     marginTop: 5,
   },
 
+  newGroupButton: {
+    minHeight: 36,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 4,
+    paddingHorizontal: 9,
+    backgroundColor: COLORS.primary,
+    borderRadius: 9,
+  },
+
+  newGroupButtonText: {
+    color: COLORS.text,
+    fontSize: 10,
+    fontWeight: '800',
+  },
+
+  groupModalBackdrop: {
+    flex: 1,
+    justifyContent: 'flex-end',
+    backgroundColor: 'rgba(0, 0, 0, 0.58)',
+  },
+
+  groupModal: {
+    maxHeight: '82%',
+    padding: 20,
+    backgroundColor: COLORS.surface,
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+
+  groupModalHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+  },
+
+  groupModalTitle: {
+    color: COLORS.text,
+    fontSize: 18,
+    fontWeight: '800',
+  },
+
+  groupNameInput: {
+    minHeight: 46,
+    color: COLORS.text,
+    fontSize: 13,
+    paddingHorizontal: 12,
+    backgroundColor: COLORS.card,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: 10,
+    marginTop: 8,
+  },
+
+  groupMemberHeading: {
+    color: COLORS.text,
+    fontSize: 12,
+    fontWeight: '700',
+    marginTop: 18,
+    marginBottom: 8,
+  },
+
+  groupMemberList: {
+    maxHeight: 250,
+  },
+
+  groupMemberOption: {
+    minHeight: 56,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingHorizontal: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: COLORS.border,
+  },
+
+  groupMemberOptionSelected: {
+    backgroundColor: '#132C2B',
+  },
+
+  groupMemberName: {
+    flex: 1,
+    color: COLORS.text,
+    fontSize: 12,
+    fontWeight: '700',
+  },
+
+  groupNoMembers: {
+    color: COLORS.muted,
+    fontSize: 12,
+    lineHeight: 18,
+    paddingVertical: 14,
+  },
+
+  groupModalActions: {
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 18,
+  },
+
+  groupCancelButton: {
+    flex: 1,
+    minHeight: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: 10,
+  },
+
+  groupCancelButtonText: {
+    color: COLORS.text,
+    fontSize: 12,
+    fontWeight: '700',
+  },
+
+  groupCreateButton: {
+    flex: 1,
+    minHeight: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: COLORS.primary,
+    borderRadius: 10,
+  },
+
+  groupCreateButtonDisabled: {
+    opacity: 0.45,
+  },
+
+  groupCreateButtonText: {
+    color: COLORS.text,
+    fontSize: 12,
+    fontWeight: '800',
+  },
+
   requestSummaryCard: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -2672,6 +3872,40 @@ if (!granted) {
     fontWeight: '600',
   },
 
+  requestAuthCodeContainer: {
+    marginTop: 14,
+    padding: 12,
+    backgroundColor: COLORS.background,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+
+  requestAuthCodeLabel: {
+    color: COLORS.muted,
+    fontSize: 9,
+    fontWeight: '800',
+    letterSpacing: 1,
+    textAlign: 'center',
+  },
+
+  requestAuthCode: {
+    color: COLORS.green,
+    fontSize: 22,
+    fontWeight: '800',
+    letterSpacing: 2,
+    textAlign: 'center',
+    marginTop: 6,
+  },
+
+  requestAuthCodeMissing: {
+    color: '#FF9B9B',
+    fontSize: 11,
+    fontWeight: '700',
+    marginTop: 14,
+  },
+
   requestActions: {
     flexDirection: 'row',
     gap: 10,
@@ -2710,6 +3944,25 @@ if (!granted) {
 
   rejectButtonText: {
     color: COLORS.text,
+    fontSize: 12,
+    fontWeight: '700',
+  },
+
+  blockButton: {
+    flex: 1,
+    minHeight: 43,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 5,
+    backgroundColor: '#2D1F2B',
+    borderWidth: 1,
+    borderColor: '#58374A',
+    borderRadius: 12,
+  },
+
+  blockButtonText: {
+    color: '#FFB0BC',
     fontSize: 12,
     fontWeight: '700',
   },
@@ -2784,6 +4037,148 @@ if (!granted) {
     color: COLORS.muted,
     fontSize: 12,
     marginTop: 7,
+  },
+
+  profileIdBlock: {
+    width: '100%',
+    alignItems: 'center',
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    marginTop: 14,
+    backgroundColor: COLORS.card,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: 10,
+  },
+
+  profileIdLabel: {
+    color: COLORS.muted,
+    fontSize: 9,
+    fontWeight: '800',
+    letterSpacing: 1,
+  },
+
+  profileIdValue: {
+    color: COLORS.green,
+    fontSize: 10,
+    fontWeight: '800',
+    textAlign: 'center',
+    marginTop: 6,
+  },
+
+  profileIdHint: {
+    color: COLORS.muted,
+    fontSize: 9,
+    textAlign: 'center',
+    marginTop: 5,
+  },
+
+  profileSetupBackdrop: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 22,
+    backgroundColor: 'rgba(0, 0, 0, 0.66)',
+  },
+
+  profileSetupModal: {
+    width: '100%',
+    maxWidth: 420,
+    alignItems: 'center',
+    padding: 22,
+    backgroundColor: COLORS.surface,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: 14,
+  },
+
+  profileSetupIcon: {
+    width: 48,
+    height: 48,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: COLORS.primary,
+    borderRadius: 14,
+    marginBottom: 14,
+  },
+
+  profileSetupTitle: {
+    color: COLORS.text,
+    fontSize: 19,
+    fontWeight: '800',
+    textAlign: 'center',
+  },
+
+  profileSetupDescription: {
+    color: COLORS.muted,
+    fontSize: 12,
+    lineHeight: 18,
+    textAlign: 'center',
+    marginTop: 8,
+  },
+
+  profileSetupInput: {
+    width: '100%',
+    minHeight: 46,
+    color: COLORS.text,
+    fontSize: 13,
+    paddingHorizontal: 12,
+    backgroundColor: COLORS.card,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: 10,
+    marginTop: 18,
+  },
+
+  profileSetupActions: {
+    width: '100%',
+    flexDirection: 'row',
+    gap: 9,
+    marginTop: 12,
+  },
+
+  profileSetupGeneratedButton: {
+    flex: 1,
+    minHeight: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 8,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: 10,
+  },
+
+  profileSetupGeneratedText: {
+    color: COLORS.green,
+    fontSize: 10,
+    fontWeight: '800',
+    textAlign: 'center',
+  },
+
+  profileSetupSaveButton: {
+    flex: 1,
+    minHeight: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: COLORS.primary,
+    borderRadius: 10,
+  },
+
+  profileSetupSaveButtonDisabled: {
+    opacity: 0.45,
+  },
+
+  profileSetupSaveText: {
+    color: COLORS.text,
+    fontSize: 12,
+    fontWeight: '800',
+  },
+
+  profileSetupId: {
+    color: COLORS.muted,
+    fontSize: 9,
+    textAlign: 'center',
+    marginTop: 14,
   },
 
   editProfileButton: {
@@ -2880,6 +4275,48 @@ if (!granted) {
   settingDivider: {
     height: 1,
     backgroundColor: COLORS.border,
+  },
+
+  blockedDevicesList: {
+    backgroundColor: COLORS.surface,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+  },
+
+  blockedDeviceRow: {
+    minHeight: 64,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+
+  unblockButton: {
+    paddingHorizontal: 11,
+    paddingVertical: 8,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: 8,
+  },
+
+  unblockButtonText: {
+    color: COLORS.primary,
+    fontSize: 11,
+    fontWeight: '700',
+  },
+
+  blockedDevicesNote: {
+    color: COLORS.muted,
+    fontSize: 10,
+    lineHeight: 15,
+    paddingBottom: 12,
+  },
+
+  blockedDevicesEmpty: {
+    color: COLORS.muted,
+    fontSize: 12,
+    padding: 12,
   },
 
   profileFooter: {
@@ -2987,6 +4424,20 @@ if (!granted) {
     borderTopColor: COLORS.border,
   },
 
+  chatToolButton: {
+    width: 36,
+    height: 42,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 10,
+  },
+
+  chatToolButtonRecording: {
+    backgroundColor: '#2D1F2B',
+    borderWidth: 1,
+    borderColor: '#58374A',
+  },
+
   chatComposerInput: {
     flex: 1,
     minHeight: 47,
@@ -3035,8 +4486,17 @@ if (!granted) {
   messageRowTheirs: {
     justifyContent: 'flex-start',
   },
-  messageBubble: {
+  messageBubbleColumn: {
     maxWidth: '84%',
+  },
+  messageBubbleColumnMine: {
+    alignItems: 'flex-end',
+  },
+  messageBubbleColumnTheirs: {
+    alignItems: 'flex-start',
+  },
+  messageBubble: {
+    maxWidth: '100%',
     borderRadius: 17,
     paddingHorizontal: 13,
     paddingTop: 10,
@@ -3058,6 +4518,46 @@ if (!granted) {
     fontSize: 14,
     lineHeight: 20,
   },
+  messageImage: {
+    width: 220,
+    maxWidth: '100%',
+    aspectRatio: 1.2,
+    borderRadius: 8,
+  },
+  sharedFilePreview: {
+    minWidth: 170,
+    maxWidth: 240,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 9,
+  },
+  sharedFileInfo: {
+    flex: 1,
+    minWidth: 0,
+  },
+  sharedFileName: {
+    color: COLORS.text,
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  sharedFileType: {
+    color: COLORS.muted,
+    fontSize: 10,
+    marginTop: 4,
+  },
+  voiceMessageButton: {
+    minWidth: 170,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingVertical: 4,
+  },
+  voiceMessageLabel: {
+    flex: 1,
+    color: COLORS.text,
+    fontSize: 12,
+    fontWeight: '700',
+  },
   messageMeta: {
     flexDirection: 'row',
     justifyContent: 'flex-end',
@@ -3072,6 +4572,21 @@ if (!granted) {
   messageStatus: {
     color: COLORS.green,
     fontSize: 9,
+  },
+  messageStatusPartial: {
+    color: '#FFC36B',
+  },
+  messageActions: {
+    minHeight: 30,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+  },
+  messageActionButton: {
+    width: 30,
+    height: 30,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   chatSendButtonDisabled: {
     opacity: 0.45,

@@ -44,6 +44,19 @@ export const nearby = {
   sendMessage: (endpointId, message) =>
     requireNativeModule().sendMessage(endpointId, message),
 
+  sendFile: (endpointId, fileUri, messageId, fileName, mimeType, kind, sentAt, senderName, senderId) =>
+    requireNativeModule().sendFile(
+      endpointId,
+      fileUri,
+      messageId,
+      fileName,
+      mimeType,
+      kind,
+      sentAt,
+      senderName,
+      senderId
+    ),
+
   stopDiscovery: () =>
     requireNativeModule().stopDiscovery(),
 

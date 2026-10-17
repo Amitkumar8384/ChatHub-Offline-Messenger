@@ -15,11 +15,20 @@
         "android.permission.BLUETOOTH_CONNECT",
         "android.permission.ACCESS_FINE_LOCATION",
         "android.permission.ACCESS_COARSE_LOCATION",
-        "android.permission.NEARBY_WIFI_DEVICES"
+        "android.permission.NEARBY_WIFI_DEVICES",
+        "android.permission.RECORD_AUDIO"
       ]
     },
     "plugins": [
-      "expo-font"
+      "expo-font",
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "Allow ChatHub to record voice messages."
+        }
+      ],
+      "expo-sharing",
+      "expo-asset"
     ]
   }
 }
