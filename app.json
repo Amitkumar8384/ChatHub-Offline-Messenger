@@ -1,25 +1,38 @@
 {
   "expo": {
-    "name": "ChatHub",
+    "name": "ChatHub Offline",
     "slug": "chathub",
-    "version": "1.0.0",
+    "version": "1.0.2",
+    "platforms": [
+      "android"
+    ],
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
+    "icon": "./assets/icon.png",
     "android": {
       "package": "com.chathub.offline",
-      "versionCode": 1,
+      "versionCode": 3,
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundColor": "#07182E",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
       "permissions": [
         "android.permission.BLUETOOTH",
         "android.permission.BLUETOOTH_ADMIN",
         "android.permission.BLUETOOTH_SCAN",
         "android.permission.BLUETOOTH_CONNECT",
+        "android.permission.BLUETOOTH_ADVERTISE",
         "android.permission.ACCESS_FINE_LOCATION",
         "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_WIFI_STATE",
+        "android.permission.CHANGE_WIFI_STATE",
         "android.permission.NEARBY_WIFI_DEVICES",
         "android.permission.RECORD_AUDIO"
       ]
     },
     "plugins": [
+      "./plugins/withNearbyConnections",
       "expo-font",
       [
         "expo-audio",
@@ -28,7 +41,15 @@
         }
       ],
       "expo-sharing",
-      "expo-asset"
+      "expo-asset",
+      "expo-secure-store",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow ChatHub to scan connection QR codes.",
+          "recordAudioAndroid": false
+        }
+      ]
     ]
   }
 }

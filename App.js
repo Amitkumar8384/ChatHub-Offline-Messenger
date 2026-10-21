@@ -12,9 +12,16 @@ import {
   TextInput,
   TouchableOpacity,
   Platform,
+  BackHandler,
+  ToastAndroid,
+  useWindowDimensions,
+  Animated,
+  Easing,
 } from 'react-native';
 
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { CameraView, useCameraPermissions } from 'expo-camera';
+import QRCode from 'react-native-qrcode-svg';
 
 import { nearby } from './src/nearby';
 import { requestNearbyPermissions } from './src/nearbyPermissions';
@@ -31,18 +38,35 @@ import {
 import * as DocumentPicker from 'expo-document-picker';
 import * as Sharing from 'expo-sharing';
 import * as Crypto from 'expo-crypto';
+import {
+  createIdentityAnnouncement,
+  decryptMeshMessage,
+  encryptMeshMessage,
+  loadOrCreateMeshIdentity,
+  verifyIdentityAnnouncement,
+  verifyMeshEnvelope,
+} from './src/meshCrypto';
+import * as FileSystem from 'expo-file-system/legacy';
+import * as Clipboard from 'expo-clipboard';
 
 const COLORS = {
-  background: '#070B14',
-  surface: '#101827',
-  card: '#121D2F',
-  border: '#24334D',
-  primary: '#6D8DFF',
-  text: '#F4F7FF',
-  muted: '#91A0BA',
-  green: '#36D6A0',
-  purple: '#B29AFF',
+  background: '#07111B',
+  surface: '#101B25',
+  card: '#16232E',
+  border: '#293A46',
+  primary: '#B8F36B',
+  text: '#F4F8F6',
+  muted: '#A5B2B9',
+  green: '#B8F36B',
+  purple: '#C6F58D',
+  cyan: '#62D8E8',
+  mint: '#60D6A8',
+  pink: '#F28FB8',
+  blue: '#82A7FF',
+  violet: '#B49AFF',
+  amber: '#F4C76D',
 };
+const MAX_MESH_HOPS = 4;
 
 function mergeRestoredChats(savedChats, currentChats) {
   const chatKey = chat => chat.id || chat.endpointId;
@@ -75,6 +99,14 @@ function mergeRestoredChats(savedChats, currentChats) {
   return [...chatsByEndpoint.values()].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
 }
 
+function profileKey(id = '') {
+  return String(id).replace(/-/g, '').toLowerCase();
+}
+
+function profileKeyFromName(name = '') {
+  return String(name).match(/\bCH-([A-Z0-9]{8})\b/i)?.[1]?.toLowerCase() || '';
+}
+
 
 
 function Avatar({ initials, color, size = 52, online = false }) {
@@ -85,7 +117,7 @@ function Avatar({ initials, color, size = 52, online = false }) {
         {
           width: size,
           height: size,
-          borderRadius: size / 3,
+        borderRadius: size / 2,
           backgroundColor: color || COLORS.card,
         },
       ]}
@@ -116,11 +148,14 @@ function IconButton({
   size = 20,
   color = COLORS.text,
   style,
+  accessibilityLabel,
 }) {
   return (
     <TouchableOpacity
       onPress={onPress}
       activeOpacity={0.75}
+      accessibilityRole="button"
+      accessibilityLabel={accessibilityLabel || name.replace(/-outline/g, '').replace(/-/g, ' ')}
       style={[styles.iconButton, style]}
     >
       <Ionicons name={name} size={size} color={color} />
@@ -142,16 +177,16 @@ function SectionTitle({ title, action, onAction }) {
   );
 }
 
-function EmptyState({ icon, title, description }) {
+function EmptyState({ icon, title, description, compact = false }) {
   return (
-    <View style={styles.emptyState}>
-      <View style={styles.emptyIcon}>
+    <View style={[styles.emptyState, compact && styles.emptyStateCompact]}>
+      <View style={[styles.emptyIcon, compact && styles.emptyIconCompact]}>
         <Ionicons name={icon} size={30} color={COLORS.primary} />
       </View>
 
       <Text style={styles.emptyTitle}>{title}</Text>
 
-      <Text style={styles.emptyDescription}>{description}</Text>
+      <Text style={[styles.emptyDescription, compact && styles.emptyStateCompactDescription]}>{description}</Text>
     </View>
   );
 }
@@ -182,27 +217,48 @@ function VoiceMessage({ uri }) {
 }
 
 export default function App() {
+  const { width: windowWidth, height: windowHeight } = useWindowDimensions();
+  const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [activeTab, setActiveTab] = useState('Home');
   const [searchQuery, setSearchQuery] = useState('');
+  const [chatFilter, setChatFilter] = useState('All');
   const [isScanning, setIsScanning] = useState(false);
+  const [isQrScannerOpen, setIsQrScannerOpen] = useState(false);
+  const [isMyQrOpen, setIsMyQrOpen] = useState(false);
+  const [isCameraReady, setIsCameraReady] = useState(false);
+  const [cameraMountError, setCameraMountError] = useState('');
+  const qrScanHandledRef = useRef(false);
+  const scanPulse = useRef(new Animated.Value(0)).current;
   const scanningRef = useRef(false);
   const [nearbyDevices, setNearbyDevices] = useState([]);
   const [connectedDevices, setConnectedDevices] = useState([]);
+  const connectedDevicesRef = useRef([]);
+  const peerByEndpointRef = useRef(new Map());
+  const expectedPeerByEndpointRef = useRef(new Map());
   const [chats, setChats] = useState([]);
+  const meshIdentityRef = useRef(null);
+  const meshPeersRef = useRef(new Map());
+  const seenMeshPacketsRef = useRef(new Map());
   const chatsLoadedRef = useRef(false);
   const [messageDraft, setMessageDraft] = useState('');
   const [requests, setRequests] = useState([]);
   const [notice, setNotice] = useState('');
   const [selectedChat, setSelectedChat] = useState(null);
   const selectedChatRef = useRef(null);
+  const lastBackPressRef = useRef(0);
   const [isGroupModalOpen, setIsGroupModalOpen] = useState(false);
   const [newGroupName, setNewGroupName] = useState('');
   const [selectedGroupMembers, setSelectedGroupMembers] = useState([]);
   const [profileName, setProfileName] = useState('');
   const [profileId, setProfileId] = useState('');
   const profileIdRef = useRef('');
+  const legacyProfileIdRef = useRef('');
   const [profileSetupName, setProfileSetupName] = useState('');
   const [isProfileSetupVisible, setIsProfileSetupVisible] = useState(false);
+  const qrCodeSize = Math.min(
+    220,
+    Math.max(140, Math.min(windowWidth - 184, windowHeight - 560))
+  );
   const profileNameDirtyRef = useRef(false);
   const [isEditingProfile, setIsEditingProfile] = useState(false);
   const audioRecorder = useAudioRecorder({
@@ -214,19 +270,178 @@ export default function App() {
   const blockedDevicesRef = useRef(new Map());
   const blockedDevicesLoadedRef = useRef(false);
 
+  useEffect(() => {
+    connectedDevicesRef.current = connectedDevices;
+  }, [connectedDevices]);
+
+  useEffect(() => {
+    if (!isScanning) {
+      scanPulse.stopAnimation();
+      scanPulse.setValue(0);
+      return undefined;
+    }
+
+    const pulse = Animated.loop(Animated.timing(scanPulse, {
+      toValue: 1,
+      duration: 1500,
+      easing: Easing.out(Easing.quad),
+      useNativeDriver: true,
+    }));
+    pulse.start();
+    return () => pulse.stop();
+  }, [isScanning, scanPulse]);
+
   function getGeneratedDisplayName(id = profileId) {
     const shortId = id.replace(/-/g, '').slice(0, 6).toUpperCase();
     return shortId ? `User-${shortId}` : 'ChatHub User';
   }
 
-  function getFullProfileId(id = profileId) {
+  function getFullProfileId(id = legacyProfileIdRef.current || profileId) {
     return id ? `CH-${id.toUpperCase()}` : '';
   }
 
   function getPublicDisplayName(name = profileName, id = profileIdRef.current || profileId) {
+    id = legacyProfileIdRef.current || id;
     const shortId = id.replace(/-/g, '').slice(0, 8).toUpperCase();
     const displayName = name.trim() || getGeneratedDisplayName(id);
     return shortId ? `${displayName} · CH-${shortId}` : displayName;
+  }
+
+  function getNearbyEndpointName(name = profileName, id = profileIdRef.current || profileId) {
+    const displayName = name.trim() || getGeneratedDisplayName(id);
+    return id ? `${displayName.slice(0, 80)} · CH-${id}` : displayName;
+  }
+
+  function getEndpointPeerId(endpointName = '') {
+    return String(endpointName).match(/(?:^|\s)CH-([\da-f]{64})(?:$|\s)/i)?.[1]?.toLowerCase() || '';
+  }
+
+  function getEndpointDisplayName(endpointName = '') {
+    return String(endpointName).replace(/\s*[·•]?\s*CH-[\da-f]{64}(?:$|\s)/i, '').trim() || 'Nearby device';
+  }
+
+  function rememberMeshPeer(peer) {
+    const known = meshPeersRef.current.get(peer.id);
+    if (known && (known.signingPublicKey !== peer.signingPublicKey
+      || known.encryptionPublicKey !== peer.encryptionPublicKey)) return false;
+    meshPeersRef.current.set(peer.id, { ...known, ...peer });
+    AsyncStorage.setItem('@chathub/mesh-peers', JSON.stringify([...meshPeersRef.current.values()]))
+      .catch(error => console.warn('Could not save mesh peer keys:', error));
+    return true;
+  }
+
+  async function handleMeshAnnouncement(packet, sourceEndpointId) {
+    const hopsLeft = Number(packet.hopsLeft);
+    if (!Number.isInteger(hopsLeft) || hopsLeft < 0 || hopsLeft > MAX_MESH_HOPS) return;
+    const peer = verifyIdentityAnnouncement(packet);
+    if (!peer || peer.id === profileIdRef.current) return;
+    const expectedPeerId = hopsLeft === MAX_MESH_HOPS
+      ? expectedPeerByEndpointRef.current.get(sourceEndpointId)
+      : null;
+    if (expectedPeerId && expectedPeerId !== peer.id) {
+      expectedPeerByEndpointRef.current.delete(sourceEndpointId);
+      nearby.disconnect(sourceEndpointId).catch(error => {
+        console.warn('Could not disconnect a device with a mismatched identity:', error);
+      });
+      setNotice('This device did not match its saved identity and was disconnected.');
+      return;
+    }
+    if (sourceEndpointId && hopsLeft === MAX_MESH_HOPS) {
+      expectedPeerByEndpointRef.current.delete(sourceEndpointId);
+    }
+    if (!rememberMeshPeer(peer)) return;
+    const firstSeen = !seenMeshPacketsRef.current.has(peer.id);
+    seenMeshPacketsRef.current.set(peer.id, Date.now());
+
+    if (sourceEndpointId) {
+      peerByEndpointRef.current.set(sourceEndpointId, peer.id);
+      setConnectedDevices(previous => previous.map(device => device.endpointId === sourceEndpointId
+        ? { ...device, profileId: peer.id }
+        : device));
+      setChats(previous => previous.map(chat => chat.endpointId === sourceEndpointId
+        ? { ...chat, profileId: peer.id }
+        : chat));
+    }
+
+    if (firstSeen && sourceEndpointId && meshIdentityRef.current) {
+      nearby.sendMessage(sourceEndpointId, createIdentityAnnouncement(meshIdentityRef.current, getPublicDisplayName()))
+        .catch(error => console.warn('Could not reply to mesh identity announcement:', error));
+    }
+
+    if (firstSeen && hopsLeft > 0) {
+      const forwarded = JSON.stringify({ ...packet, hopsLeft: hopsLeft - 1 });
+      await Promise.allSettled(connectedDevicesRef.current
+        .filter(device => device.endpointId !== sourceEndpointId)
+        .map(device => nearby.sendMessage(device.endpointId, forwarded)));
+    }
+  }
+
+  async function handleMeshEnvelope(packet, sourceEndpointId) {
+    const hopsLeft = Number(packet.hopsLeft);
+    if (!packet.id || typeof packet.recipientId !== 'string'
+      || typeof packet.senderId !== 'string' || packet.ciphertext?.length > 24000
+      || !Number.isInteger(hopsLeft) || hopsLeft < 0 || hopsLeft > MAX_MESH_HOPS) return;
+    const sender = verifyMeshEnvelope(packet);
+    if (!sender) return;
+    const known = meshPeersRef.current.get(sender.id);
+    if (known && (known.signingPublicKey !== sender.signingPublicKey
+      || known.encryptionPublicKey !== sender.encryptionPublicKey)) return;
+    rememberMeshPeer(sender);
+
+    const now = Date.now();
+    for (const [packetId, seenAt] of seenMeshPacketsRef.current) {
+      if (now - seenAt > 10 * 60 * 1000) seenMeshPacketsRef.current.delete(packetId);
+    }
+    if (seenMeshPacketsRef.current.has(packet.id)) return;
+    seenMeshPacketsRef.current.set(packet.id, now);
+    if (seenMeshPacketsRef.current.size > 2000) {
+      const oldest = seenMeshPacketsRef.current.keys().next().value;
+      if (oldest) seenMeshPacketsRef.current.delete(oldest);
+    }
+
+    if (packet.recipientId === profileIdRef.current) {
+      const plaintext = decryptMeshMessage(packet, sender, meshIdentityRef.current);
+      if (!plaintext || !meshIdentityRef.current) return;
+      if (plaintext.type === 'group-message') {
+        saveGroupMessage(plaintext);
+        return;
+      }
+      if (plaintext.type !== 'direct-message' || typeof plaintext.message?.text !== 'string') return;
+      const incoming = {
+        ...plaintext.message,
+        sender: 'them',
+        senderId: sender.id,
+        status: 'received',
+      };
+      const directSource = connectedDevicesRef.current.find(device =>
+        device.endpointId === sourceEndpointId && device.profileId === sender.id
+      );
+      const name = incoming.senderName || directSource?.name || `Nearby-${sender.id.slice(0, 6)}`;
+      const activeChatMatches = selectedChatRef.current?.profileId === sender.id
+        || selectedChatRef.current?.endpointId === directSource?.endpointId;
+      saveOrUpdateChat({ endpointId: directSource?.endpointId, profileId: sender.id, name }, chat => {
+        const isNewMessage = !(chat.messages || []).some(item => item.id === incoming.id);
+        return {
+          ...chat,
+          profileId: sender.id,
+          name,
+          initials: getInitials(name),
+          messages: isNewMessage ? [...(chat.messages || []), incoming] : chat.messages,
+          message: incoming.text,
+          time: new Date(incoming.sentAt || Date.now()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          unread: !isNewMessage || activeChatMatches ? 0 : (chat.unread || 0) + 1,
+          updatedAt: incoming.sentAt || Date.now(),
+        };
+      });
+      setNotice(`Encrypted message from ${name}`);
+      return;
+    }
+
+    if (hopsLeft <= 0) return;
+    const forwarded = JSON.stringify({ ...packet, hopsLeft: hopsLeft - 1 });
+    await Promise.allSettled(connectedDevicesRef.current
+      .filter(device => device.endpointId !== sourceEndpointId)
+      .map(device => nearby.sendMessage(device.endpointId, forwarded)));
   }
 
   async function persistProfileName(name) {
@@ -237,7 +452,15 @@ export default function App() {
 
     if (scanningRef.current) {
       await nearby.stopAdvertising();
-      await nearby.startAdvertising(getPublicDisplayName(savedName));
+      await nearby.startAdvertising(getNearbyEndpointName(savedName));
+    }
+    if (meshIdentityRef.current) {
+      await Promise.allSettled(connectedDevicesRef.current.map(device =>
+        nearby.sendMessage(device.endpointId, createIdentityAnnouncement(
+          meshIdentityRef.current,
+          getPublicDisplayName(savedName)
+        ))
+      ));
     }
     return savedName;
   }
@@ -254,10 +477,11 @@ export default function App() {
   }
 
   function saveOrUpdateChat(device, updateFn) {
-    if (!device?.endpointId) return;
-    const id = device.endpointId;
+    const id = device?.endpointId || device?.profileId;
+    if (!id) return;
     setChats(previous => {
-      const existing = previous.find(chat => chat.endpointId === id);
+      const existing = previous.find(chat => (device.endpointId && chat.endpointId === device.endpointId)
+        || (device.profileId && chat.profileId === device.profileId));
       if (existing) {
         return previous.map(chat => chat.endpointId === id
           ? updateFn({ ...existing })
@@ -267,10 +491,11 @@ export default function App() {
       const name = device.name || device.endpointName || 'Nearby device';
       const initial = {
         id,
-        endpointId: id,
+        endpointId: device.endpointId,
+        profileId: device.profileId,
         name,
         initials: getInitials(name),
-        color: device.color || '#386B64',
+        color: device.color || '#617848',
         online: connectedDevices.some(item => item.endpointId === id),
         messages: [],
         message: 'No messages yet',
@@ -301,6 +526,10 @@ export default function App() {
       ? payload.memberNames.filter(member => typeof member === 'string' && member.trim())
       : [];
     const memberNames = [...new Set([...receivedMembers, senderName])];
+    const receivedMemberIds = Array.isArray(payload.memberIds)
+      ? payload.memberIds.map(profileKey).filter(Boolean)
+      : [];
+    const memberIds = [...new Set([...receivedMemberIds, profileKey(payload.senderId)])];
 
     setChats(previous => {
       const existing = previous.find(chat => chat.kind === 'group' && chat.id === groupId);
@@ -314,8 +543,9 @@ export default function App() {
         kind: 'group',
         name: payload.groupName || existing?.name || 'Group chat',
         initials: getInitials(payload.groupName || existing?.name || 'Group chat'),
-        color: existing?.color || '#386B64',
+        color: existing?.color || '#617848',
         memberNames: [...new Set([...(existing?.memberNames || []), ...memberNames])],
+        memberIds: [...new Set([...(existing?.memberIds || []), ...memberIds])],
         messages,
         message: message.text,
         time: new Date(sentAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
@@ -417,7 +647,8 @@ export default function App() {
       try {
         subscriptions.push(
           nearby.addListener('deviceFound', device => {
-            const name = device.endpointName || device.name || 'Nearby device';
+            const endpointName = device.endpointName || device.name || 'Nearby device';
+            const name = getEndpointDisplayName(endpointName);
             if (isBlockedDevice(name)) return;
             setNearbyDevices(previous => {
               const exists = previous.some(item => item.endpointId === device.endpointId);
@@ -437,12 +668,27 @@ export default function App() {
 
         subscriptions.push(
           nearby.addListener('connectionRequest', request => {
-            const name = request.endpointName || request.name || 'Nearby device';
+            const endpointName = request.endpointName || request.name || 'Nearby device';
+            const name = getEndpointDisplayName(endpointName);
             if (isBlockedDevice(name)) {
               nearby.rejectConnection(request.endpointId).catch(error => {
                 console.warn('Could not reject blocked connection request:', error);
               });
               return;
+            }
+            const advertisedPeerId = getEndpointPeerId(endpointName);
+            if (advertisedPeerId) {
+              expectedPeerByEndpointRef.current.set(request.endpointId, advertisedPeerId);
+              if (meshPeersRef.current.has(advertisedPeerId)) {
+                nearby.acceptConnection(request.endpointId).then(() => {
+                  setNotice(`Reconnecting to verified device ${name}…`);
+                }).catch(error => {
+                  expectedPeerByEndpointRef.current.delete(request.endpointId);
+                  console.warn('Could not auto-accept a verified device:', error);
+                  setNotice(`Could not reconnect to ${name}. Try again nearby.`);
+                });
+                return;
+              }
             }
             setRequests(previous => {
               const pendingRequest = {
@@ -450,7 +696,9 @@ export default function App() {
                 endpointId: request.endpointId,
                 name,
                 initials: getInitials(name),
-                detail: 'Compare this code with the other device before accepting.',
+                detail: advertisedPeerId
+                  ? 'New device · compare the verification code before accepting.'
+                  : 'Compare this code with the other device before accepting.',
                 authenticationToken: request.authenticationToken,
                 isOutgoing: Boolean(request.isOutgoing),
                 color: '#7558A6',
@@ -465,19 +713,35 @@ export default function App() {
         subscriptions.push(
           nearby.addListener('connectionChanged', event => {
             const status = String(event.status || '').toLowerCase();
-            const name = event.endpointName || event.name || getDeviceName(event.endpointId, 'Connected device');
+            const name = getEndpointDisplayName(event.endpointName || event.name || getDeviceName(event.endpointId, 'Connected device'));
             if (status === 'connected') {
               const device = {
                 endpointId: event.endpointId,
                 name,
+                profileId: peerByEndpointRef.current.get(event.endpointId),
                 initials: getInitials(name),
-                color: '#386B64',
+                color: '#617848',
               };
               setConnectedDevices(previous => previous.some(item => item.endpointId === event.endpointId)
                 ? previous.map(item => item.endpointId === event.endpointId ? { ...item, ...device } : item)
                 : [...previous, device]);
               setRequests(previous => previous.filter(item => item.endpointId !== event.endpointId));
               saveOrUpdateChat(device, chat => ({ ...chat, name, initials: getInitials(name), online: true, updatedAt: Date.now() }));
+              if (meshIdentityRef.current) {
+                nearby.sendMessage(event.endpointId, createIdentityAnnouncement(meshIdentityRef.current, getPublicDisplayName()))
+                  .catch(error => console.warn('Could not announce secure mesh identity:', error));
+              }
+              meshPeersRef.current.forEach(peer => {
+                if (peer.announcement) {
+                  try {
+                    const announcement = JSON.parse(peer.announcement);
+                    nearby.sendMessage(event.endpointId, JSON.stringify({ ...announcement, hopsLeft: 1 }))
+                      .catch(error => console.warn('Could not share mesh peer identity:', error));
+                  } catch (error) {
+                    console.warn('Could not restore mesh identity announcement:', error);
+                  }
+                }
+              });
               setNotice(`${name} connected successfully`);
             } else if (['disconnected', 'failed', 'rejected'].includes(status)) {
               setConnectedDevices(previous => previous.filter(item => item.endpointId !== event.endpointId));
@@ -489,55 +753,49 @@ export default function App() {
         );
 
         subscriptions.push(
-          nearby.addListener('messageReceived', event => {
+          nearby.addListener('messageReceived', async event => {
             const rawMessage = event.message;
             if (typeof rawMessage !== 'string') return;
             let payload;
             try {
               payload = JSON.parse(rawMessage);
             } catch {
-              payload = { text: rawMessage, id: `${Date.now()}-${Math.random()}`, sentAt: Date.now() };
-            }
-            if (payload.type === 'group-message') {
-              saveGroupMessage(payload);
+              setNotice('An unencrypted message from an older app was ignored.');
               return;
             }
-            const text = typeof payload.text === 'string' ? payload.text : rawMessage;
-            const endpointId = event.endpointId;
-            const name = event.endpointName || getDeviceName(endpointId, 'Nearby device');
-            const message = {
-              id: payload.id || `${Date.now()}-${Math.random()}`,
-              text,
-              sentAt: Number(payload.sentAt) || Date.now(),
-              senderId: payload.senderId || '',
-              sender: 'them',
-              senderName: payload.senderName || name,
-              status: 'received',
-            };
-            saveOrUpdateChat({ endpointId, name }, chat => {
-              const isNewMessage = !(chat.messages || []).some(item => item.id === message.id);
-              const messages = isNewMessage ? [...(chat.messages || []), message] : chat.messages;
-              return {
-                ...chat,
-                name,
-                initials: getInitials(name),
-                messages,
-                message: text,
-                time: new Date(message.sentAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-                unread: !isNewMessage || selectedChatRef.current?.endpointId === endpointId
-                  ? 0
-                  : (chat.unread || 0) + 1,
-                updatedAt: message.sentAt,
-              };
-            });
-            setNotice(`New message from ${name}`);
+            if (payload.type === 'mesh-hello') {
+              await handleMeshAnnouncement(payload, event.endpointId);
+              return;
+            }
+            if (payload.type === 'mesh-envelope') {
+              await handleMeshEnvelope(payload, event.endpointId);
+              return;
+            }
+            if (payload.type === 'group-message') {
+              setNotice('An unencrypted group message was ignored.');
+              return;
+            }
+            setNotice('Unsupported or unencrypted message was ignored.');
           })
         );
 
         subscriptions.push(
-          nearby.addListener('fileReceived', event => {
+          nearby.addListener('fileReceived', async event => {
             const endpointId = event.endpointId;
             const name = event.endpointName || getDeviceName(endpointId, 'Nearby device');
+            let persistentUri = event.uri;
+            if (event.uri) {
+              try {
+                const directory = `${FileSystem.documentDirectory}received-files/`;
+                await FileSystem.makeDirectoryAsync(directory, { intermediates: true });
+                const extension = String(event.fileName || '').match(/\.([a-z0-9]{1,10})$/i)?.[1] || 'bin';
+                const safeExtension = extension.toLowerCase();
+                persistentUri = `${directory}${Crypto.randomUUID()}.${safeExtension}`;
+                await FileSystem.copyAsync({ from: event.uri, to: persistentUri });
+              } catch (error) {
+                console.warn('Could not preserve received file:', error);
+              }
+            }
             const message = {
               id: event.messageId || `file-${event.payloadId}`,
               payloadId: event.payloadId,
@@ -545,7 +803,7 @@ export default function App() {
               type: event.kind || 'file',
               name: event.fileName || 'Shared file',
               mimeType: event.mimeType || 'application/octet-stream',
-              uri: event.uri,
+              uri: persistentUri,
               sentAt: Number(event.sentAt) || Date.now(),
               sender: 'them',
               senderName: event.senderName || name,
@@ -630,36 +888,51 @@ export default function App() {
     let mounted = true;
 
     const loadProfileIdentity = async () => {
-      let savedId = '';
       let savedName = '';
       try {
-        [savedId, savedName] = await Promise.all([
-          AsyncStorage.getItem('@chathub/profile-id'),
+        const [storedName, storedPeers, storedProfileId, storedLegacyProfileId] = await Promise.all([
           AsyncStorage.getItem('@chathub/profile-name'),
+          AsyncStorage.getItem('@chathub/mesh-peers'),
+          AsyncStorage.getItem('@chathub/profile-id'),
+          AsyncStorage.getItem('@chathub/legacy-profile-id'),
         ]);
-      } catch (error) {
-        console.warn('Could not load profile identity:', error);
-      }
-
-      const identity = savedId || Crypto.randomUUID();
-      if (!savedId) {
+        savedName = storedName || '';
+        let savedPeers = [];
         try {
-          await AsyncStorage.setItem('@chathub/profile-id', identity);
+          savedPeers = storedPeers ? JSON.parse(storedPeers) : [];
         } catch (error) {
-          console.warn('Could not save profile ID:', error);
+          console.warn('Could not restore encrypted mesh peers:', error);
         }
+        if (Array.isArray(savedPeers)) {
+          meshPeersRef.current = new Map(savedPeers.filter(peer => peer?.id && peer?.signingPublicKey && peer?.encryptionPublicKey)
+            .map(peer => [peer.id, peer]));
+        }
+        const identity = await loadOrCreateMeshIdentity();
+        meshIdentityRef.current = identity;
+        legacyProfileIdRef.current = storedLegacyProfileId || storedProfileId || identity.id;
+        profileIdRef.current = identity.id;
+        setProfileId(identity.id);
+        await AsyncStorage.setItem('@chathub/legacy-profile-id', legacyProfileIdRef.current);
+        await AsyncStorage.setItem('@chathub/profile-id', identity.id);
+        seenMeshPacketsRef.current.set(identity.id, Date.now());
+        if (savedName.trim()) {
+          setProfileName(savedName.trim());
+        } else {
+          setProfileName(getGeneratedDisplayName(identity.id));
+          setProfileSetupName('');
+          setIsProfileSetupVisible(true);
+        }
+        connectedDevicesRef.current.forEach(device => {
+          const displayName = getPublicDisplayName(savedName || getGeneratedDisplayName(identity.id));
+          nearby.sendMessage(device.endpointId, createIdentityAnnouncement(identity, displayName)).catch(error => {
+            console.warn('Could not announce secure mesh identity:', error);
+          });
+        });
+      } catch (error) {
+        console.warn('Could not initialize encrypted mesh identity:', error);
+        setNotice('Secure messaging could not start on this device.');
       }
       if (!mounted) return;
-
-      profileIdRef.current = identity;
-      setProfileId(identity);
-      if (savedName?.trim()) {
-        setProfileName(savedName.trim());
-      } else {
-        setProfileName(getGeneratedDisplayName(identity));
-        setProfileSetupName('');
-        setIsProfileSetupVisible(true);
-      }
     };
 
     loadProfileIdentity();
@@ -693,6 +966,40 @@ export default function App() {
   useEffect(() => {
     selectedChatRef.current = selectedChat;
   }, [selectedChat]);
+
+  useEffect(() => {
+    if (Platform.OS !== 'android') return undefined;
+
+    const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      if (selectedChat) {
+        closeChat();
+        return true;
+      }
+
+      if (isEditingProfile) {
+        setIsEditingProfile(false);
+        return true;
+      }
+
+      if (activeTab !== 'Home') {
+        setActiveTab('Home');
+        setSearchQuery('');
+        lastBackPressRef.current = 0;
+        return true;
+      }
+
+      const now = Date.now();
+      if (now - lastBackPressRef.current < 2000) {
+        BackHandler.exitApp();
+      } else {
+        lastBackPressRef.current = now;
+        ToastAndroid.show('Press back again to exit', ToastAndroid.SHORT);
+      }
+      return true;
+    });
+
+    return () => subscription.remove();
+  }, [activeTab, isEditingProfile, selectedChat]);
 
   useEffect(() => {
     if (!notice) {
@@ -738,7 +1045,6 @@ export default function App() {
   }
 
   scanningRef.current = true;
-  setIsScanning(true);
   setNotice('Searching for nearby devices...');
 
   try {
@@ -760,10 +1066,11 @@ if (!granted) {
     }
 
     await nearby.startDiscovery();
+    setIsScanning(true);
 
     let advertisingStarted = true;
     try {
-      await nearby.startAdvertising(getPublicDisplayName());
+      await nearby.startAdvertising(getNearbyEndpointName());
     } catch (advertisingError) {
       console.warn('Advertising start error:', advertisingError);
 
@@ -776,6 +1083,11 @@ if (!granted) {
     if (advertisingStarted) {
       setNotice('Searching for nearby devices...');
     }
+    if (Platform.OS === 'android') {
+      nearby.playScanStartSound().catch(error => {
+        console.warn('Could not play scan-start sound:', error);
+      });
+    }
   } catch (error) {
     console.warn('Start scanning error:', error);
 
@@ -787,6 +1099,69 @@ if (!granted) {
     );
   }
 }
+
+  async function openQrScanner() {
+    if (!cameraPermission?.granted) {
+      const permission = await requestCameraPermission();
+      if (!permission.granted) {
+        setNotice('Camera permission is needed to scan a connection QR.');
+        return;
+      }
+    }
+    qrScanHandledRef.current = false;
+    setIsCameraReady(false);
+    setCameraMountError('');
+    setIsQrScannerOpen(true);
+  }
+
+  function handleConnectionQrScanned({ data }) {
+    if (qrScanHandledRef.current) return;
+    qrScanHandledRef.current = true;
+    try {
+      const packet = JSON.parse(data);
+      const peer = verifyIdentityAnnouncement(packet);
+      if (!peer || peer.id === profileIdRef.current) {
+        throw new Error('This QR is not a valid ChatHub connection code.');
+      }
+      if (!rememberMeshPeer(peer)) {
+        throw new Error('This QR conflicts with a previously saved identity.');
+      }
+      const name = peer.name || `ChatHub-${peer.id.slice(0, 6)}`;
+      setChats(previous => {
+        const existing = previous.find(chat => chat.profileId === peer.id);
+        if (existing) return previous;
+        return [{
+          id: peer.id,
+          profileId: peer.id,
+          name,
+          initials: getInitials(name),
+          color: '#617848',
+          online: false,
+          messages: [],
+          message: 'QR verified · connect nearby to chat',
+          time: '',
+          unread: 0,
+          updatedAt: Date.now(),
+        }, ...previous];
+      });
+      setIsQrScannerOpen(false);
+      setNotice(`Verified ${name}. Searching nearby so you can connect.`);
+      if (!scanningRef.current) startScanning();
+    } catch (error) {
+      qrScanHandledRef.current = false;
+      setNotice(error.message || 'Could not read this ChatHub connection QR.');
+    }
+  }
+
+  function getConnectionQrValue() {
+    if (!meshIdentityRef.current) return '';
+    return createIdentityAnnouncement(
+      meshIdentityRef.current,
+      getPublicDisplayName(),
+      0
+    );
+  }
+
   async function stopScanning() {
   try {
     await nearby.stopDiscovery();
@@ -814,7 +1189,7 @@ if (!granted) {
       }
 
       const deviceName = device.name || device.endpointName || 'Nearby device';
-      await nearby.requestConnection(device.endpointId, getPublicDisplayName());
+      await nearby.requestConnection(device.endpointId, getNearbyEndpointName());
       saveOrUpdateChat({ ...device, name: deviceName }, chat => ({
         ...chat, name: deviceName, initials: getInitials(deviceName), updatedAt: Date.now()
       }));
@@ -888,10 +1263,14 @@ if (!granted) {
       return;
     }
 
-    const latest = chats.find(item => item.endpointId === chat.endpointId) || chat;
+    const latest = chats.find(item => (chat.profileId && item.profileId === chat.profileId)
+      || (chat.endpointId && item.endpointId === chat.endpointId)) || chat;
     setSelectedChat(latest);
     setChats(previous => previous.map(item =>
-      item.endpointId === chat.endpointId ? { ...item, unread: 0 } : item
+      (chat.profileId && item.profileId === chat.profileId)
+        || (chat.endpointId && item.endpointId === chat.endpointId)
+        ? { ...item, unread: 0 }
+        : item
     ));
     setMessageDraft('');
   }
@@ -906,8 +1285,33 @@ if (!granted) {
   }
 
   function getGroupRecipients(group) {
+    const memberIds = new Set([
+      ...(group.memberIds || []).map(profileKey),
+      ...(group.memberNames || []).map(profileKeyFromName),
+    ].filter(Boolean));
+    const shortMemberIds = new Set([...memberIds].map(id => id.slice(0, 8)));
     const memberNames = new Set((group.memberNames || []).map(normalizeDeviceName));
-    return connectedDevices.filter(device => memberNames.has(normalizeDeviceName(device.name)));
+    return connectedDevices.filter(device => {
+      const deviceKey = profileKey(device.profileId);
+      if (deviceKey && memberIds.has(deviceKey)) return true;
+      const shortDeviceKey = profileKeyFromName(device.name);
+      if (shortDeviceKey && shortMemberIds.has(shortDeviceKey)) return true;
+      if (deviceKey || shortDeviceKey) return false;
+      // Legacy peers without the public CH identity can only be matched by name.
+      return memberNames.has(normalizeDeviceName(device.name));
+    });
+  }
+
+  function getGroupMemberIds(group) {
+    const ids = new Set((group.memberIds || []).map(profileKey).filter(id => id.length >= 32));
+    const legacyNames = new Set((group.memberNames || []).map(normalizeDeviceName));
+    meshPeersRef.current.forEach(peer => {
+      if (peer.name && legacyNames.has(normalizeDeviceName(peer.name))) ids.add(peer.id);
+    });
+    connectedDevices.forEach(device => {
+      if (device.profileId && legacyNames.has(normalizeDeviceName(device.name))) ids.add(profileKey(device.profileId));
+    });
+    return [...ids];
   }
 
   function createGroupChat() {
@@ -921,15 +1325,23 @@ if (!granted) {
       setNotice('Select at least one connected device.');
       return;
     }
+    if (members.some(device => !device.profileId || !meshPeersRef.current.has(device.profileId))) {
+      setNotice('Wait for each device to finish secure identity exchange, then try again.');
+      return;
+    }
 
     const memberNames = [...new Set([getPublicDisplayName(), ...members.map(device => device.name)])];
+    const memberIds = [...new Set([profileKey(profileId), ...members.map(device =>
+      profileKey(device.profileId)
+    ).filter(Boolean)])];
     const group = {
       id: `group-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       kind: 'group',
       name: groupName,
       initials: getInitials(groupName),
-      color: '#386B64',
+      color: '#617848',
       memberNames,
+      memberIds,
       messages: [],
       message: `${memberNames.length} members`,
       time: '',
@@ -945,11 +1357,64 @@ if (!granted) {
     setNotice(`Group ${groupName} created`);
   }
 
+  async function transmitGroupMessage(group, message) {
+    const recipientIds = [...new Set(getGroupMemberIds(group))]
+      .filter(id => id && id !== profileKey(profileId));
+    const neighbors = connectedDevicesRef.current;
+    if (recipientIds.length === 0 || neighbors.length === 0) {
+      setNotice('Connect to at least one mesh device before sending.');
+      return false;
+    }
+    try {
+      const missingKeys = recipientIds.filter(id => !meshPeersRef.current.has(id));
+      if (missingKeys.length) throw new Error('Secure key missing for one or more group members');
+      const payload = {
+        type: 'group-message',
+        groupId: group.id,
+        groupName: group.name,
+        memberNames: group.memberNames,
+        memberIds: [...new Set(recipientIds.concat(profileKey(profileId)))],
+        id: message.id,
+        text: message.text,
+        sentAt: message.sentAt,
+        senderName: message.senderName || getPublicDisplayName(),
+        senderId: message.senderId || profileId,
+      };
+      const attempts = recipientIds.flatMap(recipientId => {
+        const envelope = encryptMeshMessage(meshIdentityRef.current, meshPeersRef.current.get(recipientId), payload, 'group-message');
+        return neighbors.map(device => nearby.sendMessage(device.endpointId, envelope));
+      });
+      const results = await Promise.allSettled(attempts);
+      const succeeded = new Set();
+      results.forEach((result, index) => {
+        if (result.status === 'fulfilled') succeeded.add(recipientIds[Math.floor(index / neighbors.length)]);
+      });
+      const status = succeeded.size === recipientIds.length ? 'sent' : succeeded.size > 0 ? 'partial' : 'failed';
+      setChats(previous => previous.map(chat => chat.kind === 'group' && chat.id === group.id
+        ? { ...chat, messages: (chat.messages || []).map(item => item.id === message.id ? { ...item, status } : item) }
+        : chat
+      ));
+      if (status !== 'sent') {
+        setNotice(status === 'partial'
+          ? `Message was forwarded toward ${succeeded.size} of ${recipientIds.length} group members.`
+          : 'Message could not be sent to the group.');
+      }
+      return status !== 'failed';
+    } catch (error) {
+      console.warn('Group message send failed:', error);
+      setChats(previous => previous.map(chat => chat.kind === 'group' && chat.id === group.id
+        ? { ...chat, messages: (chat.messages || []).map(item => item.id === message.id ? { ...item, status: 'failed' } : item) }
+        : chat
+      ));
+      setNotice('Message could not be sent to the group.');
+      return false;
+    }
+  }
+
   async function sendGroupChatMessage(text) {
     const group = chats.find(item => item.kind === 'group' && item.id === selectedChat?.id) || selectedChat;
-    const recipients = getGroupRecipients(group);
-    if (recipients.length === 0) {
-      setNotice('No group members are connected right now.');
+    if (connectedDevicesRef.current.length === 0) {
+      setNotice('Connect to at least one mesh device before sending.');
       return;
     }
 
@@ -975,63 +1440,49 @@ if (!granted) {
       : chat
     ));
 
-    const payload = JSON.stringify({
-      type: 'group-message',
-      groupId: group.id,
-      groupName: group.name,
-      memberNames: group.memberNames,
-      id: message.id,
-      text,
-      sentAt,
-      senderName: message.senderName,
-      senderId: message.senderId,
-    });
-    const results = await Promise.allSettled(recipients.map(device =>
-      nearby.sendMessage(device.endpointId, payload)
-    ));
-    const succeeded = results.filter(result => result.status === 'fulfilled').length;
-    const status = succeeded === recipients.length ? 'sent' : succeeded > 0 ? 'partial' : 'failed';
-    setChats(previous => previous.map(chat => chat.kind === 'group' && chat.id === group.id
-      ? {
-          ...chat,
-          messages: (chat.messages || []).map(item => item.id === message.id ? { ...item, status } : item),
-        }
-      : chat
-    ));
-    if (status !== 'sent') {
-      setNotice(status === 'partial'
-        ? `Message reached ${succeeded} of ${recipients.length} connected group members.`
-        : 'Message could not be sent to the group.');
-    }
+    await transmitGroupMessage(group, message);
   }
 
-  async function transmitChatMessage(endpointId, message) {
-    const connected = connectedDevices.some(device => device.endpointId === endpointId);
-    if (!connected) {
-      setNotice('Reconnect to this device before retrying the message.');
+  async function transmitChatMessage(targetId, message) {
+    const targetProfileId = profileKey(targetId)
+      || chats.find(chat => chat.endpointId === targetId)?.profileId
+      || connectedDevices.find(device => device.endpointId === targetId)?.profileId;
+    const recipient = meshPeersRef.current.get(targetProfileId);
+    const neighbors = connectedDevicesRef.current;
+    if (!targetProfileId || !recipient || neighbors.length === 0 || !meshIdentityRef.current) {
+      if (targetProfileId) {
+        setChats(previous => previous.map(chat => chat.profileId === targetProfileId || chat.endpointId === targetId
+          ? { ...chat, messages: (chat.messages || []).map(item => item.id === message.id ? { ...item, status: 'failed' } : item) }
+          : chat
+        ));
+      }
+      setNotice('Secure route unavailable. Connect nearby devices and wait for key exchange.');
       return;
     }
 
-    setChats(previous => previous.map(chat => chat.endpointId === endpointId
+    setChats(previous => previous.map(chat => chat.profileId === targetProfileId || chat.endpointId === targetId
       ? { ...chat, messages: (chat.messages || []).map(item => item.id === message.id ? { ...item, status: 'sending' } : item) }
       : chat
     ));
 
     try {
-      await nearby.sendMessage(endpointId, JSON.stringify({
-        id: message.id,
-        text: message.text,
-        sentAt: message.sentAt,
-        senderName: message.senderName || getPublicDisplayName(),
-        senderId: message.senderId || profileId,
-      }));
-      setChats(previous => previous.map(chat => chat.endpointId === endpointId
+      const envelope = encryptMeshMessage(meshIdentityRef.current, recipient, {
+        type: 'direct-message',
+        message: {
+          ...message,
+          senderName: message.senderName || getPublicDisplayName(),
+          senderId: message.senderId || profileId,
+        },
+      });
+      const results = await Promise.allSettled(neighbors.map(device => nearby.sendMessage(device.endpointId, envelope)));
+      if (!results.some(result => result.status === 'fulfilled')) throw new Error('No mesh neighbor accepted the message');
+      setChats(previous => previous.map(chat => chat.profileId === targetProfileId || chat.endpointId === targetId
         ? { ...chat, messages: (chat.messages || []).map(item => item.id === message.id ? { ...item, status: 'sent' } : item) }
         : chat
       ));
     } catch (error) {
       console.warn('Message send failed:', error);
-      setChats(previous => previous.map(chat => chat.endpointId === endpointId
+      setChats(previous => previous.map(chat => chat.profileId === targetProfileId || chat.endpointId === targetId
         ? { ...chat, messages: (chat.messages || []).map(item => item.id === message.id ? { ...item, status: 'failed' } : item) }
         : chat
       ));
@@ -1209,7 +1660,13 @@ if (!granted) {
     }
   }
 
-  function deleteChatMessage(endpointId, messageId) {
+  function retryGroupMessage(group, message) {
+    if (message.status === 'failed' || message.status === 'partial') {
+      transmitGroupMessage(group, message);
+    }
+  }
+
+  function deleteChatMessage(chat, messageId) {
     Alert.alert(
       'Delete this message?',
       'This removes it from this phone only. The other person may still have it.',
@@ -1218,12 +1675,17 @@ if (!granted) {
         {
           text: 'Delete',
           style: 'destructive',
-          onPress: () => setChats(previous => previous.map(chat => {
-            if (chat.endpointId !== endpointId) return chat;
-            const messages = (chat.messages || []).filter(message => message.id !== messageId);
+          onPress: () => setChats(previous => previous.map(item => {
+            const matchesChat = chat.kind === 'group'
+              ? item.kind === 'group' && item.id === chat.id
+              : chat.profileId
+                ? item.profileId === chat.profileId
+                : Boolean(chat.endpointId) && item.endpointId === chat.endpointId;
+            if (!matchesChat) return item;
+            const messages = (item.messages || []).filter(message => message.id !== messageId);
             const latestMessage = messages[messages.length - 1];
             return {
-              ...chat,
+              ...item,
               messages,
               message: latestMessage?.text || 'No messages yet',
               time: latestMessage
@@ -1244,10 +1706,10 @@ if (!granted) {
       await sendGroupChatMessage(text);
       return;
     }
-    if (!selectedChat.endpointId) return;
-    const connected = connectedDevices.some(device => device.endpointId === selectedChat.endpointId);
-    if (!connected) {
-      setNotice('Connect to this device before sending messages.');
+    const targetProfileId = selectedChat.profileId
+      || connectedDevices.find(device => device.endpointId === selectedChat.endpointId)?.profileId;
+    if (!targetProfileId || connectedDevicesRef.current.length === 0) {
+      setNotice('Connect to a mesh device and wait for secure identity exchange.');
       return;
     }
 
@@ -1262,7 +1724,8 @@ if (!granted) {
       status: 'sending',
     };
     setMessageDraft('');
-    setChats(previous => previous.map(chat => chat.endpointId === selectedChat.endpointId
+    setChats(previous => previous.map(chat => chat.profileId === targetProfileId
+      || chat.endpointId === selectedChat.endpointId
       ? {
           ...chat,
           messages: [...(chat.messages || []), message],
@@ -1273,7 +1736,7 @@ if (!granted) {
         }
       : chat
     ));
-    await transmitChatMessage(selectedChat.endpointId, message);
+    await transmitChatMessage(targetProfileId, message);
   }
 
   function renderHeader() {
@@ -1284,13 +1747,13 @@ if (!granted) {
             <Ionicons
               name="chatbubbles"
               size={24}
-              color={COLORS.text}
+              color={COLORS.background}
             />
           </View>
 
           <View>
             <Text style={styles.brandTitle}>ChatHub</Text>
-            <Text style={styles.brandSubtitle}>PRIVATE · OFFLINE</Text>
+            <Text style={styles.brandSubtitle}>PRIVATE MESSAGING</Text>
           </View>
         </View>
 
@@ -1301,13 +1764,18 @@ if (!granted) {
               size={13}
               color={COLORS.green}
             />
-            <Text style={styles.privacyBadgeText}>Private</Text>
+            <Text style={styles.privacyBadgeText}>OFFLINE</Text>
           </View>
 
           <IconButton
             name="person-circle-outline"
             size={26}
-            onPress={() => setActiveTab('Profile')}
+            accessibilityLabel="Open profile"
+            onPress={() => {
+              setSelectedChat(null);
+              setActiveTab('Profile');
+              setSearchQuery('');
+            }}
           />
         </View>
       </View>
@@ -1315,17 +1783,15 @@ if (!granted) {
   }
 
   function renderGreeting() {
+    const firstName = (profileName || 'there').trim().split(/\s+/)[0];
+    const hour = new Date().getHours();
+    const greeting = hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
+
     return (
       <View style={styles.greetingContainer}>
-        <Text style={styles.greetingEyebrow}>YOUR PRIVATE SPACE</Text>
-
-        <Text style={styles.greetingTitle}>
-          Hey, {profileName || 'there'} 👋
-        </Text>
-
-        <Text style={styles.greetingDescription}>
-          Connect nearby. Chat privately. Share freely.
-        </Text>
+        <Text style={styles.greetingEyebrow}>{greeting}</Text>
+        <Text style={styles.greetingTitle}>{firstName}</Text>
+        <Text style={styles.greetingSubtitle}>Your private network at a glance</Text>
       </View>
     );
   }
@@ -1335,30 +1801,44 @@ if (!granted) {
       <View style={styles.scannerCard}>
         <View style={styles.scannerCardTop}>
           <View style={styles.scannerTextContainer}>
-            <View style={styles.scannerLabelRow}>
-              <View style={styles.liveDot} />
-              <Text style={styles.scannerEyebrow}>
-                OFFLINE CONNECTION
-              </Text>
-            </View>
-
             <Text style={styles.scannerTitle}>
-              People nearby
+              Find people nearby
             </Text>
-
             <Text style={styles.scannerDescription}>
-              Discover devices around you without the internet.
+              {isScanning
+                ? `${nearbyDevices.length} nearby ${nearbyDevices.length === 1 ? 'device' : 'devices'} found. Keep scanning to discover more.`
+                : 'Connect with nearby ChatHub devices, privately.'}
             </Text>
           </View>
 
           <View style={styles.scannerVisual}>
+            {isScanning ? (
+              <Animated.View
+                pointerEvents="none"
+                style={[
+                  styles.scannerPulseRing,
+                  {
+                    opacity: scanPulse.interpolate({
+                      inputRange: [0, 0.78, 1],
+                      outputRange: [0.65, 0.16, 0],
+                    }),
+                    transform: [{
+                      scale: scanPulse.interpolate({
+                        inputRange: [0, 1],
+                        outputRange: [0.68, 1.72],
+                      }),
+                    }],
+                  },
+                ]}
+              />
+            ) : null}
             <View style={styles.scannerCircleOuter}>
               <View style={styles.scannerCircleMiddle}>
                 <View style={styles.scannerCircleInner}>
                   <Ionicons
                     name="radio"
                     size={28}
-                    color={COLORS.text}
+                    color={COLORS.background}
                   />
                 </View>
               </View>
@@ -1377,29 +1857,55 @@ if (!granted) {
             />
 
             <Text style={styles.scannerStatusText}>
-              {isScanning
-                ? 'Scanning for devices...'
-                : 'Ready to discover'}
+              {isScanning ? 'Searching nearby' : 'Ready to connect'}
             </Text>
           </View>
 
+          <View style={styles.scannerActionRow}>
+            <TouchableOpacity
+              style={[styles.scanButton, isScanning && styles.scanButtonActive]}
+              accessibilityRole="button"
+              accessibilityLabel={isScanning ? 'Stop nearby scan' : 'Start nearby scan'}
+              onPress={isScanning ? stopScanning : startScanning}
+              activeOpacity={0.8}
+            >
+              <Ionicons name={isScanning ? 'stop' : 'scan'} size={17} color={isScanning ? COLORS.text : COLORS.background} />
+              <Text style={[styles.scanButtonText, isScanning && styles.scanButtonTextActive]}>
+                {isScanning ? 'Stop scan' : 'Start scan'}
+              </Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </View>
+    );
+  }
+
+  function renderConnectionQrCard() {
+    return (
+      <View style={styles.qrConnectCard}>
+        <View style={styles.qrConnectHeading}>
+          <View style={styles.qrConnectIcon}>
+            <Ionicons name="qr-code-outline" size={20} color={COLORS.primary} />
+          </View>
+          <View style={styles.qrConnectCopy}>
+            <Text style={styles.qrConnectTitle}>Connect with QR</Text>
+          <Text style={styles.qrConnectDescription}>Verify someone once, then reconnect faster next time.</Text>
+          </View>
+        </View>
+        <View style={styles.qrConnectActions}>
+              <TouchableOpacity accessibilityRole="button" style={styles.qrActionButton} onPress={openQrScanner} activeOpacity={0.8}>
+            <Ionicons name="scan-outline" size={17} color={COLORS.primary} />
+            <Text style={styles.qrActionText}>Scan QR</Text>
+          </TouchableOpacity>
           <TouchableOpacity
-            style={[
-              styles.scanButton,
-              isScanning && styles.scanButtonActive,
-            ]}
-            onPress={isScanning ? stopScanning : startScanning}
+            style={styles.qrActionButton}
+            accessibilityRole="button"
+            onPress={() => setIsMyQrOpen(true)}
+            disabled={!meshIdentityRef.current}
             activeOpacity={0.8}
           >
-            <Ionicons
-              name={isScanning ? 'stop' : 'scan'}
-              size={17}
-              color={COLORS.text}
-            />
-
-            <Text style={styles.scanButtonText}>
-              {isScanning ? 'Stop scan' : 'Find people'}
-            </Text>
+            <Ionicons name="qr-code" size={17} color={COLORS.primary} />
+            <Text style={styles.qrActionText}>Show my QR</Text>
           </TouchableOpacity>
         </View>
       </View>
@@ -1412,26 +1918,32 @@ if (!granted) {
         label: 'Nearby',
         value: String(nearbyDevices.length),
         icon: 'radio-outline',
-        color: COLORS.primary,
+        color: COLORS.cyan,
       },
       {
         label: 'Connected',
         value: String(connectedDevices.length),
         icon: 'link-outline',
-        color: COLORS.green,
+        color: COLORS.mint,
       },
       {
-        label: 'Requests',
-        value: String(requests.length),
-        icon: 'people-outline',
-        color: COLORS.purple,
+        label: 'Chats',
+        value: String(chats.length),
+        icon: 'chatbubbles-outline',
+        color: COLORS.blue,
       },
     ];
 
     return (
       <View style={styles.statsContainer}>
         {stats.map(stat => (
-          <View key={stat.label} style={styles.statCard}>
+          <View
+            key={stat.label}
+            style={[
+              styles.statCard,
+              { backgroundColor: `${stat.color}0D`, borderColor: `${stat.color}30` },
+            ]}
+          >
             <View
               style={[
                 styles.statIcon,
@@ -1452,19 +1964,61 @@ if (!granted) {
       </View>
     );
   }
+
+  function renderHomeQuickActions() {
+    return (
+      <View style={styles.homeQuickActions}>
+        <TouchableOpacity
+          style={styles.homeQuickAction}
+          onPress={openQrScanner}
+          accessibilityRole="button"
+          accessibilityLabel="Scan a connection QR code"
+          activeOpacity={0.8}
+        >
+          <View style={[styles.homeQuickIcon, { backgroundColor: 'rgba(98,216,232,0.12)' }]}>
+            <Ionicons name="scan-outline" size={19} color={COLORS.cyan} />
+          </View>
+          <View style={styles.homeQuickCopy}>
+            <Text style={styles.homeQuickTitle}>Scan QR</Text>
+            <Text style={styles.homeQuickSubtitle}>Connect securely</Text>
+          </View>
+          <Ionicons name="chevron-forward" size={17} color={COLORS.muted} />
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={styles.homeQuickAction}
+          onPress={() => setIsMyQrOpen(true)}
+          disabled={!meshIdentityRef.current}
+          accessibilityRole="button"
+          accessibilityLabel="Show my connection QR code"
+          activeOpacity={0.8}
+        >
+          <View style={[styles.homeQuickIcon, { backgroundColor: 'rgba(180,154,255,0.12)' }]}>
+            <Ionicons name="qr-code-outline" size={19} color={COLORS.violet} />
+          </View>
+          <View style={styles.homeQuickCopy}>
+            <Text style={styles.homeQuickTitle}>My QR</Text>
+            <Text style={styles.homeQuickSubtitle}>Let others connect</Text>
+          </View>
+          <Ionicons name="chevron-forward" size={17} color={COLORS.muted} />
+        </TouchableOpacity>
+      </View>
+    );
+  }
     function renderHome() {
     return (
       <ScrollView
         showsVerticalScrollIndicator={false}
+        keyboardShouldPersistTaps="handled"
         contentContainerStyle={styles.screenContent}
       >
         {renderGreeting()}
         {renderScannerCard()}
+        {renderHomeQuickActions()}
         {renderStats()}
 
         <SectionTitle
-          title="Connected devices"
-          action="View all"
+          title="Your connections"
+          action="See all"
           onAction={() => setActiveTab('Nearby')}
         />
 
@@ -1479,9 +2033,7 @@ if (!granted) {
 
               <View style={styles.deviceInfo}>
                 <Text style={styles.deviceName}>{device.name}</Text>
-                <Text style={styles.deviceSubtitle}>
-                  Secure connection established
-                </Text>
+                <Text style={styles.deviceSubtitle}>Ready to chat nearby</Text>
               </View>
 
               <IconButton
@@ -1523,75 +2075,50 @@ if (!granted) {
           </View>
         )}
 
-        <SectionTitle
-          title="Recent conversations"
-          action="See all"
-          onAction={() => setActiveTab('Chats')}
-        />
-
-        {chats.slice(0, 3).map(chat => (
-          <TouchableOpacity
-            key={chat.id}
-            style={styles.chatRow}
-            onPress={() => openChat(chat)}
-            activeOpacity={0.75}
-          >
-            <Avatar
-              initials={chat.initials}
-              color={chat.color}
-              online={chat.online}
+        {chats.length > 0 && (
+          <>
+            <SectionTitle
+              title="Recent conversations"
+              action="See all"
+              onAction={() => setActiveTab('Chats')}
             />
 
-            <View style={styles.chatInfo}>
-              <View style={styles.chatNameRow}>
-                <Text style={styles.chatName}>{chat.name}</Text>
-                <Text style={styles.chatTime}>{chat.time}</Text>
-              </View>
+            {chats.slice(0, 3).map(chat => (
+              <TouchableOpacity
+                key={chat.id}
+                style={styles.chatRow}
+                onPress={() => openChat(chat)}
+                activeOpacity={0.75}
+              >
+                <Avatar
+                  initials={chat.initials || getInitials(chat.name)}
+                  color={chat.color}
+                  online={chat.online}
+                />
+                <View style={styles.chatInfo}>
+                  <View style={styles.chatNameRow}>
+                    <Text style={styles.chatName} numberOfLines={1}>{chat.name}</Text>
+                    <Text style={styles.chatTime}>{chat.time}</Text>
+                  </View>
+                  <View style={styles.chatPreviewRow}>
+                    <Text style={styles.chatPreview} numberOfLines={1}>{chat.message}</Text>
+                    {chat.unread > 0 ? (
+                      <View style={styles.unreadBadge}>
+                        <Text style={styles.unreadBadgeText}>{chat.unread > 99 ? '99+' : chat.unread}</Text>
+                      </View>
+                    ) : null}
+                  </View>
+                </View>
+              </TouchableOpacity>
+            ))}
+          </>
+        )}
 
-              <Text style={styles.chatPreview} numberOfLines={1}>
-                {chat.message}
-              </Text>
-            </View>
-
-            {chat.unread > 0 ? (
-              <View style={styles.unreadBadge}>
-                <Text style={styles.unreadBadgeText}>
-                  {chat.unread}
-                </Text>
-              </View>
-            ) : (
-              <Ionicons
-                name="chevron-forward"
-                size={17}
-                color={COLORS.muted}
-              />
-            )}
-          </TouchableOpacity>
-        ))}
-
-        <View style={styles.securityBanner}>
-          <View style={styles.securityBannerIcon}>
-            <Ionicons
-              name="shield-checkmark"
-              size={22}
-              color={COLORS.green}
-            />
-          </View>
-
-          <View style={styles.securityBannerContent}>
-            <Text style={styles.securityBannerTitle}>
-              Your privacy comes first
-            </Text>
-            <Text style={styles.securityBannerDescription}>
-              ChatHub is designed for direct, nearby connections.
-            </Text>
-          </View>
-        </View>
       </ScrollView>
     );
   }
 
-  function renderSearchBar() {
+  function renderSearchBar(placeholder = 'Search nearby devices...') {
     return (
       <View style={styles.searchBar}>
         <Ionicons
@@ -1602,7 +2129,8 @@ if (!granted) {
 
         <TextInput
           style={styles.searchInput}
-          placeholder="Search nearby devices..."
+          accessibilityLabel={placeholder}
+          placeholder={placeholder}
           placeholderTextColor={COLORS.muted}
           value={searchQuery}
           onChangeText={setSearchQuery}
@@ -1623,88 +2151,114 @@ if (!granted) {
   }
 
   function renderNearby() {
+    const radarSize = Math.min(windowWidth - 80, 320);
+    const radarPositions = [
+      { left: '20%', top: '23%' },
+      { left: '68%', top: '28%' },
+      { left: '73%', top: '64%' },
+      { left: '26%', top: '72%' },
+      { left: '47%', top: '13%' },
+      { left: '12%', top: '48%' },
+    ];
+
     return (
       <ScrollView
         showsVerticalScrollIndicator={false}
+        keyboardShouldPersistTaps="handled"
         contentContainerStyle={styles.screenContent}
       >
         <View style={styles.pageHeading}>
-          <Text style={styles.pageEyebrow}>DISCOVER</Text>
-          <Text style={styles.pageTitle}>Nearby people</Text>
-          <Text style={styles.pageDescription}>
-            Find and connect with devices around you.
-          </Text>
-        </View>
-
-        {renderSearchBar()}
-
-        <View style={styles.discoveryStatusCard}>
-          <View style={styles.discoveryStatusLeft}>
-            <View
-              style={[
-                styles.discoveryStatusIcon,
-                isScanning && styles.discoveryStatusIconActive,
-              ]}
-            >
-              <Ionicons
-                name="radio-outline"
-                size={25}
-                color={isScanning ? COLORS.green : COLORS.primary}
-              />
-            </View>
-
-            <View style={styles.discoveryStatusText}>
-              <Text style={styles.discoveryStatusTitle}>
-                {isScanning ? 'Searching for devices' : 'Discovery is paused'}
-              </Text>
-
-              <Text style={styles.discoveryStatusSubtitle}>
-                {isScanning
-                  ? 'Keep this screen open while searching.'
-                  : 'Start scanning to discover nearby phones.'}
-              </Text>
-            </View>
+          <View>
+            <Text style={styles.pageTitle}>Nearby</Text>
+            <Text style={styles.nearbyPageSubtitle}>Discover devices around you</Text>
           </View>
-
-          <View
-            style={[
-              styles.statusPill,
-              isScanning && styles.statusPillActive,
-            ]}
-          >
-            <View
-              style={[
-                styles.statusPillDot,
-                isScanning && styles.statusPillDotActive,
-              ]}
-            />
-
-            <Text
-              style={[
-                styles.statusPillText,
-                isScanning && styles.statusPillTextActive,
-              ]}
-            >
-              {isScanning ? 'ACTIVE' : 'IDLE'}
+          <View style={[styles.statusPill, isScanning && styles.statusPillActive]}>
+            <View style={[styles.statusPillDot, isScanning && styles.statusPillDotActive]} />
+            <Text style={[styles.statusPillText, isScanning && styles.statusPillTextActive]}>
+              {isScanning ? 'SCANNING' : 'READY'}
             </Text>
           </View>
         </View>
 
-        <TouchableOpacity
-          style={styles.primaryButton}
-          onPress={isScanning ? stopScanning : startScanning}
-          activeOpacity={0.8}
-        >
-          <Ionicons
-            name={isScanning ? 'stop-circle-outline' : 'scan-outline'}
-            size={20}
-            color={COLORS.text}
-          />
+        <View style={styles.radarCard}>
+          <View style={styles.radarHeading}>
+            <View>
+              <Text style={styles.radarTitle}>{isScanning ? 'Looking around' : 'Ready to discover'}</Text>
+              <Text style={styles.radarSubtitle}>
+                {filteredDevices.length > 0
+                  ? `${filteredDevices.length} ${filteredDevices.length === 1 ? 'device' : 'devices'} in range`
+                  : isScanning ? 'Keep ChatHub open to find nearby phones' : 'Start scanning to find nearby phones'}
+              </Text>
+            </View>
+            <View style={styles.radarSignalIcon}>
+              <Ionicons name="wifi-outline" size={20} color={COLORS.primary} />
+            </View>
+          </View>
 
-          <Text style={styles.primaryButtonText}>
-            {isScanning ? 'Stop discovery' : 'Scan for nearby devices'}
+          <View style={[styles.radarCanvas, { width: radarSize, height: radarSize }]}>
+            <View style={[styles.radarRing, styles.radarRingOuter]} />
+            <View style={[styles.radarRing, styles.radarRingMiddle]} />
+            <View style={[styles.radarRing, styles.radarRingInner]} />
+            <View style={styles.radarCrosshairVertical} />
+            <View style={styles.radarCrosshairHorizontal} />
+            {isScanning ? (
+              <Animated.View
+                pointerEvents="none"
+                style={[
+                  styles.radarPulseRing,
+                  {
+                    opacity: scanPulse.interpolate({
+                      inputRange: [0, 0.7, 1],
+                      outputRange: [0.7, 0.2, 0],
+                    }),
+                    transform: [{
+                      scale: scanPulse.interpolate({ inputRange: [0, 1], outputRange: [0.55, 1.1] }),
+                    }],
+                  },
+                ]}
+              />
+            ) : null}
+            {filteredDevices.slice(0, radarPositions.length).map((device, index) => (
+              <View
+                key={device.endpointId || device.id || index}
+                style={[styles.radarDeviceMarker, radarPositions[index]]}
+              >
+                <View style={styles.radarDeviceDot}>
+                  <Ionicons name="phone-portrait" size={13} color={COLORS.background} />
+                </View>
+                <Text style={styles.radarDeviceLabel} numberOfLines={1}>
+                  {(device.name || device.endpointName || 'Device').split(/[ ·-]/)[0].slice(0, 10)}
+                </Text>
+              </View>
+            ))}
+            <View style={styles.radarCenter}>
+              <Ionicons name="radio" size={27} color={COLORS.background} />
+            </View>
+          </View>
+
+          <TouchableOpacity
+            style={[styles.radarScanButton, isScanning && styles.radarScanButtonActive]}
+            onPress={isScanning ? stopScanning : startScanning}
+            accessibilityRole="button"
+            accessibilityLabel={isScanning ? 'Stop nearby scan' : 'Start nearby scan'}
+            activeOpacity={0.82}
+          >
+            <Ionicons
+              name={isScanning ? 'stop' : 'scan-outline'}
+              size={19}
+              color={isScanning ? COLORS.text : COLORS.background}
+            />
+            <Text style={[styles.radarScanButtonText, isScanning && styles.radarScanButtonTextActive]}>
+              {isScanning ? 'Stop scanning' : 'Start scanning'}
+            </Text>
+          </TouchableOpacity>
+          <Text style={styles.radarPrivacyNote}>
+            <Ionicons name="shield-checkmark-outline" size={12} color={COLORS.muted} />
+            {'  '}Only nearby ChatHub devices can appear here
           </Text>
-        </TouchableOpacity>
+        </View>
+
+        {renderSearchBar('Search nearby devices...')}
 
         <SectionTitle
           title="Available devices"
@@ -1726,7 +2280,7 @@ if (!granted) {
               >
                 <Avatar
                   initials={getInitials(deviceName)}
-                  color="#304B77"
+                  color="#607844"
                 />
 
                 <View style={styles.nearbyDeviceInfo}>
@@ -1782,6 +2336,7 @@ if (!granted) {
           })
         ) : (
           <EmptyState
+            compact
             icon="radio-outline"
             title={
               searchQuery
@@ -1793,66 +2348,91 @@ if (!granted) {
             description={
               searchQuery
                 ? 'Try a different device name.'
-                : 'Both phones should have ChatHub open, with nearby discovery enabled.'
+                : 'Open ChatHub on both phones and allow Nearby permissions.'
             }
           />
         )}
-
-        <View style={styles.infoCard}>
-          <Ionicons
-            name="information-circle-outline"
-            size={21}
-            color={COLORS.primary}
-          />
-
-          <Text style={styles.infoCardText}>
-            For discovery to work, nearby devices must have ChatHub running
-            and the required permissions enabled.
-          </Text>
-        </View>
+        {renderConnectionQrCard()}
       </ScrollView>
     );
   }
 
   function renderChats() {
-    const matchingChats = chats.filter(chat =>
-      (chat.name || 'Nearby device').toLowerCase().includes(searchQuery.toLowerCase())
-    );
+    const matchingChats = chats
+      .filter(chat => (chat.name || 'Nearby device').toLowerCase().includes(searchQuery.trim().toLowerCase()))
+      .filter(chat => chatFilter !== 'Unread' || chat.unread > 0)
+      .filter(chat => chatFilter !== 'Groups' || chat.kind === 'group')
+      .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
     const groupChats = matchingChats.filter(chat => chat.kind === 'group');
     const directChats = matchingChats.filter(chat => chat.kind !== 'group');
+    const filters = [
+      { label: 'All', count: chats.length },
+      { label: 'Unread', count: chats.filter(chat => chat.unread > 0).length },
+      { label: 'Groups', count: chats.filter(chat => chat.kind === 'group').length },
+    ];
+
+    const formatListTime = chat => {
+      if (!chat.updatedAt) return chat.time || '';
+      const date = new Date(chat.updatedAt);
+      const now = new Date();
+      const sameDay = date.toDateString() === now.toDateString();
+      const yesterday = new Date(now);
+      yesterday.setDate(now.getDate() - 1);
+      if (sameDay) return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      if (date.toDateString() === yesterday.toDateString()) return 'Yesterday';
+      return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+    };
+
+    const renderChatRow = chat => {
+      const lastMessage = chat.messages?.[chat.messages.length - 1];
+      const preview = chat.kind === 'group' && lastMessage?.senderName
+        ? `${lastMessage.sender === 'me' ? 'You' : lastMessage.senderName}: ${chat.message || ''}`
+        : chat.message || (chat.kind === 'group' ? `${chat.memberNames?.length || 1} members` : 'No messages yet');
+      return (
+        <TouchableOpacity
+          key={chat.id}
+          style={styles.chatRow}
+          onPress={() => openChat(chat)}
+          activeOpacity={0.7}
+          accessibilityRole="button"
+          accessibilityLabel={`Open chat with ${chat.name}`}
+        >
+          <Avatar
+            initials={chat.initials || getInitials(chat.name)}
+            color={chat.color}
+            size={54}
+            online={chat.kind === 'group' ? getGroupRecipients(chat).length > 0 : chat.online}
+          />
+          <View style={styles.chatInfo}>
+            <View style={styles.chatNameRow}>
+              <Text style={styles.chatName} numberOfLines={1}>{chat.name}</Text>
+              <Text style={[styles.chatTime, chat.unread > 0 && styles.chatTimeUnread]}>{formatListTime(chat)}</Text>
+            </View>
+            <View style={styles.chatPreviewRow}>
+              <Text style={[styles.chatPreview, chat.unread > 0 && styles.chatPreviewUnread]} numberOfLines={1}>
+                {preview}
+              </Text>
+              {chat.unread > 0 ? (
+                <View style={styles.unreadBadge}>
+                  <Text style={styles.unreadBadgeText}>{chat.unread > 99 ? '99+' : chat.unread}</Text>
+                </View>
+              ) : null}
+            </View>
+          </View>
+        </TouchableOpacity>
+      );
+    };
 
     return (
       <ScrollView
         showsVerticalScrollIndicator={false}
+        keyboardShouldPersistTaps="handled"
         contentContainerStyle={styles.screenContent}
       >
         <View style={styles.pageHeading}>
-          <Text style={styles.pageEyebrow}>YOUR MESSAGES</Text>
-          <Text style={styles.pageTitle}>Chats</Text>
-          <Text style={styles.pageDescription}>
-            Your conversations in one place.
-          </Text>
-        </View>
-
-        {renderSearchBar()}
-
-        <View style={styles.chatSummaryCard}>
-          <View style={styles.chatSummaryIcon}>
-            <Ionicons
-              name="chatbubbles-outline"
-              size={24}
-              color={COLORS.primary}
-            />
-          </View>
-
-          <View style={styles.chatSummaryContent}>
-            <Text style={styles.chatSummaryTitle}>
-              Your conversations
-            </Text>
-
-            <Text style={styles.chatSummaryDescription}>
-              {chats.length} conversation{chats.length === 1 ? '' : 's'}
-            </Text>
+          <View>
+            <Text style={styles.pageTitle}>Chats</Text>
+            <Text style={styles.chatPageSubtitle}>Your private conversations</Text>
           </View>
           <TouchableOpacity
             style={styles.newGroupButton}
@@ -1861,93 +2441,61 @@ if (!granted) {
             onPress={() => setIsGroupModalOpen(true)}
             activeOpacity={0.8}
           >
-            <Ionicons name="add" size={18} color={COLORS.text} />
+            <Ionicons name="people-outline" size={17} color={COLORS.background} />
             <Text style={styles.newGroupButtonText}>New group</Text>
           </TouchableOpacity>
         </View>
 
-        {groupChats.length > 0 ? (
-          <>
-            <SectionTitle title="Groups" />
-            {groupChats.map(chat => (
+        {renderSearchBar('Search conversations')}
+
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          style={styles.chatFiltersScroll}
+          contentContainerStyle={styles.chatFilters}
+        >
+          {filters.map(filter => {
+            const active = chatFilter === filter.label;
+            return (
               <TouchableOpacity
-                key={chat.id}
-                style={styles.chatRow}
-                onPress={() => openChat(chat)}
+                key={filter.label}
+                style={[styles.chatFilterChip, active && styles.chatFilterChipActive]}
+                onPress={() => setChatFilter(filter.label)}
+                accessibilityRole="button"
+                accessibilityState={{ selected: active }}
                 activeOpacity={0.75}
               >
-                <Avatar
-                  initials={chat.initials || getInitials(chat.name)}
-                  color={chat.color}
-                  online={getGroupRecipients(chat).length > 0}
-                />
-
-                <View style={styles.chatInfo}>
-                  <View style={styles.chatNameRow}>
-                    <Text style={styles.chatName}>{chat.name}</Text>
-                    <Text style={styles.chatTime}>{chat.time}</Text>
-                  </View>
-
-                  <Text style={styles.chatPreview} numberOfLines={1}>
-                    {chat.message || `${chat.memberNames?.length || 1} members`}
-                  </Text>
-                </View>
-
-                {chat.unread > 0 && (
-                  <View style={styles.unreadBadge}>
-                    <Text style={styles.unreadBadgeText}>
-                      {chat.unread}
-                    </Text>
-                  </View>
-                )}
+                <Text style={[styles.chatFilterText, active && styles.chatFilterTextActive]}>{filter.label}</Text>
+                {filter.count > 0 ? (
+                  <Text style={[styles.chatFilterCount, active && styles.chatFilterTextActive]}>{filter.count}</Text>
+                ) : null}
               </TouchableOpacity>
-            ))}
-          </>
-        ) : null}
+            );
+          })}
+        </ScrollView>
 
-        <SectionTitle title="Direct chats" />
-        {directChats.length > 0 ? (
-          directChats.map(chat => (
-            <TouchableOpacity
-              key={chat.id}
-              style={styles.chatRow}
-              onPress={() => openChat(chat)}
-              activeOpacity={0.75}
-            >
-              <Avatar initials={chat.initials} color={chat.color} online={chat.online} />
-              <View style={styles.chatInfo}>
-                <View style={styles.chatNameRow}>
-                  <Text style={styles.chatName}>{chat.name}</Text>
-                  <Text style={styles.chatTime}>{chat.time}</Text>
-                </View>
-                <Text style={styles.chatPreview} numberOfLines={1}>{chat.message}</Text>
-              </View>
-              {chat.unread > 0 ? (
-                <View style={styles.unreadBadge}>
-                  <Text style={styles.unreadBadgeText}>{chat.unread}</Text>
-                </View>
-              ) : null}
-            </TouchableOpacity>
-          ))
+        {matchingChats.length > 0 ? (
+          <View style={styles.chatList}>
+            {groupChats.length > 0 ? (
+              <>
+                <SectionTitle title="Groups" />
+                {groupChats.map(renderChatRow)}
+              </>
+            ) : null}
+            {directChats.length > 0 ? (
+              <>
+                <SectionTitle title={chatFilter === 'Unread' ? 'Unread conversations' : 'Direct messages'} />
+                {directChats.map(renderChatRow)}
+              </>
+            ) : null}
+          </View>
         ) : (
           <EmptyState
-            icon="chatbubbles-outline"
-            title={searchQuery ? 'No conversations found' : 'No direct chats yet'}
-            description="Connect with a nearby device to get started."
+            icon={searchQuery || chatFilter !== 'All' ? 'search-outline' : 'chatbubbles-outline'}
+            title={searchQuery ? 'No conversations found' : chatFilter === 'Unread' ? 'All caught up' : chatFilter === 'Groups' ? 'No groups yet' : 'No conversations yet'}
+            description={searchQuery ? 'Try another name.' : chatFilter === 'Unread' ? 'New messages will show up here.' : chatFilter === 'Groups' ? 'Start a group with connected people.' : 'Connect to someone nearby to start chatting.'}
           />
         )}
-
-        <View style={styles.infoCard}>
-          <Ionicons
-            name="information-circle-outline"
-            size={21}
-            color={COLORS.primary}
-          />
-
-          <Text style={styles.infoCardText}>
-            Chat history is saved on this phone. Messages are sent directly to connected nearby ChatHub devices.
-          </Text>
-        </View>
 
         <Modal
           visible={isGroupModalOpen}
@@ -1961,6 +2509,9 @@ if (!granted) {
                 <Text style={styles.groupModalTitle}>New group chat</Text>
                 <IconButton name="close" onPress={() => setIsGroupModalOpen(false)} />
               </View>
+              <Text style={styles.groupModalDescription}>
+                Choose a group name and select the connected people to add.
+              </Text>
               <TextInput
                 style={styles.groupNameInput}
                 value={newGroupName}
@@ -1968,6 +2519,7 @@ if (!granted) {
                 placeholder="Group name"
                 placeholderTextColor={COLORS.muted}
                 maxLength={40}
+                returnKeyType="done"
                 autoFocus
               />
               <Text style={styles.groupMemberHeading}>Connected devices</Text>
@@ -2029,38 +2581,7 @@ if (!granted) {
         contentContainerStyle={styles.screenContent}
       >
         <View style={styles.pageHeading}>
-          <Text style={styles.pageEyebrow}>CONNECTIONS</Text>
           <Text style={styles.pageTitle}>Requests</Text>
-          <Text style={styles.pageDescription}>
-            Manage people who want to connect with you.
-          </Text>
-        </View>
-
-        <View style={styles.requestSummaryCard}>
-          <View style={styles.requestSummaryIcon}>
-            <Ionicons
-              name="people-outline"
-              size={24}
-              color={COLORS.purple}
-            />
-          </View>
-
-          <View style={styles.requestSummaryContent}>
-            <Text style={styles.requestSummaryTitle}>
-              Connection requests
-            </Text>
-
-            <Text style={styles.requestSummaryDescription}>
-              {requests.length} pending request
-              {requests.length === 1 ? '' : 's'}
-            </Text>
-          </View>
-
-          <View style={styles.requestCountBadge}>
-            <Text style={styles.requestCountText}>
-              {requests.length}
-            </Text>
-          </View>
         </View>
 
         {requests.length > 0 ? (
@@ -2116,7 +2637,7 @@ if (!granted) {
                   <Ionicons
                     name="checkmark"
                     size={18}
-                    color="#071711"
+                    color="#1A1424"
                   />
 
                   <Text style={styles.acceptButtonText}>Accept</Text>
@@ -2171,17 +2692,29 @@ if (!granted) {
   }
 
   function renderProfile() {
+    const publicUserId = getFullProfileId();
+    const meshFingerprint = profileKey(profileId).toUpperCase();
+    const shortenIdentifier = value => value.length > 28
+      ? `${value.slice(0, 14)}…${value.slice(-10)}`
+      : value;
+
+    const copyProfileValue = async (value, label) => {
+      try {
+        await Clipboard.setStringAsync(value);
+        setNotice(`${label} copied`);
+      } catch (error) {
+        console.warn(`Could not copy ${label}:`, error);
+        setNotice(`Could not copy ${label}`);
+      }
+    };
+
     return (
       <ScrollView
         showsVerticalScrollIndicator={false}
         contentContainerStyle={styles.screenContent}
       >
         <View style={styles.pageHeading}>
-          <Text style={styles.pageEyebrow}>YOUR ACCOUNT</Text>
           <Text style={styles.pageTitle}>Profile</Text>
-          <Text style={styles.pageDescription}>
-            Customize your ChatHub experience.
-          </Text>
         </View>
 
         <View style={styles.profileCard}>
@@ -2196,7 +2729,7 @@ if (!granted) {
               <Ionicons
                 name="checkmark"
                 size={14}
-                color="#071711"
+                color="#1A1424"
               />
             </View>
           </View>
@@ -2220,15 +2753,40 @@ if (!granted) {
             </Text>
           )}
 
-          <Text style={styles.profileSubtitle}>
-            ChatHub member
-          </Text>
-
           <View style={styles.profileIdBlock}>
-            <Text style={styles.profileIdLabel}>UNIQUE USER ID</Text>
-            <Text selectable style={styles.profileIdValue}>{getFullProfileId()}</Text>
-            <Text style={styles.profileIdHint}>Saved on this phone; it stays the same if your name changes.</Text>
+            <View style={styles.profileIdentifierHeader}>
+              <Text style={styles.profileIdLabel}>PUBLIC USER ID</Text>
+              <TouchableOpacity
+                style={styles.copyIdentifierButton}
+                onPress={() => copyProfileValue(publicUserId, 'Public ID')}
+                accessibilityRole="button"
+                accessibilityLabel="Copy public user ID"
+              >
+                <Ionicons name="copy-outline" size={14} color={COLORS.primary} />
+                <Text style={styles.copyIdentifierText}>Copy</Text>
+              </TouchableOpacity>
+            </View>
+            <Text selectable style={styles.profileIdValue}>{shortenIdentifier(publicUserId)}</Text>
+            <Text style={styles.profileIdHint}>Your permanent ID on this phone.</Text>
+            <View style={styles.profileIdDivider} />
+            <View style={styles.profileIdentifierHeader}>
+              <Text style={styles.profileIdLabel}>MESH FINGERPRINT</Text>
+              <TouchableOpacity
+                style={styles.copyIdentifierButton}
+                onPress={() => copyProfileValue(meshFingerprint, 'Fingerprint')}
+                accessibilityRole="button"
+                accessibilityLabel="Copy mesh fingerprint"
+              >
+                <Ionicons name="copy-outline" size={14} color={COLORS.primary} />
+                <Text style={styles.copyIdentifierText}>Copy</Text>
+              </TouchableOpacity>
+            </View>
+            <Text selectable style={styles.meshFingerprint}>{shortenIdentifier(meshFingerprint)}</Text>
+            <Text style={styles.profileIdHint}>Match it with a contact to verify identity.</Text>
+            <Text style={styles.profileIdHint}>Tap and hold an ID to select its full value.</Text>
           </View>
+
+
 
           <TouchableOpacity
             style={styles.editProfileButton}
@@ -2311,96 +2869,6 @@ if (!granted) {
           </View>
         </View>
 
-        <SectionTitle title="Privacy & settings" />
-
-        <View style={styles.settingsCard}>
-          <View style={styles.settingRow}>
-            <View style={styles.settingIcon}>
-              <Ionicons
-                name="shield-checkmark-outline"
-                size={21}
-                color={COLORS.green}
-              />
-            </View>
-
-            <View style={styles.settingContent}>
-              <Text style={styles.settingTitle}>
-                Private connections
-              </Text>
-
-              <Text style={styles.settingDescription}>
-                Discover and connect with nearby devices.
-              </Text>
-            </View>
-
-            <Ionicons
-              name="chevron-forward"
-              size={18}
-              color={COLORS.muted}
-            />
-          </View>
-
-          <View style={styles.settingDivider} />
-
-          <View style={styles.settingRow}>
-            <View style={styles.settingIcon}>
-              <Ionicons
-                name="bluetooth-outline"
-                size={21}
-                color={COLORS.primary}
-              />
-            </View>
-
-            <View style={styles.settingContent}>
-              <Text style={styles.settingTitle}>
-                Nearby connectivity
-              </Text>
-
-              <Text style={styles.settingDescription}>
-                Uses supported nearby communication methods.
-              </Text>
-            </View>
-
-            <Ionicons
-              name="chevron-forward"
-              size={18}
-              color={COLORS.muted}
-            />
-          </View>
-
-          <View style={styles.settingDivider} />
-
-          <TouchableOpacity
-            style={styles.settingRow}
-            onPress={() => setNotice('ChatHub settings')}
-            activeOpacity={0.75}
-          >
-            <View style={styles.settingIcon}>
-              <Ionicons
-                name="information-circle-outline"
-                size={21}
-                color={COLORS.purple}
-              />
-            </View>
-
-            <View style={styles.settingContent}>
-              <Text style={styles.settingTitle}>
-                About ChatHub
-              </Text>
-
-              <Text style={styles.settingDescription}>
-                Offline messaging project.
-              </Text>
-            </View>
-
-            <Ionicons
-              name="chevron-forward"
-              size={18}
-              color={COLORS.muted}
-            />
-          </TouchableOpacity>
-        </View>
-
         <SectionTitle title={`Blocked devices (${blockedDevices.length})`} />
         {blockedDevices.length > 0 ? (
           <View style={styles.blockedDevicesList}>
@@ -2428,25 +2896,7 @@ if (!granted) {
               Devices with the same displayed name are blocked together. A device can change its name.
             </Text>
           </View>
-        ) : (
-          <Text style={styles.blockedDevicesEmpty}>No blocked devices.</Text>
-        )}
-
-        <View style={styles.profileFooter}>
-          <Ionicons
-            name="chatbubbles"
-            size={21}
-            color={COLORS.primary}
-          />
-
-          <Text style={styles.profileFooterBrand}>
-            ChatHub
-          </Text>
-
-          <Text style={styles.profileFooterVersion}>
-            Private communication
-          </Text>
-        </View>
+        ) : null}
       </ScrollView>
     );
   }
@@ -2456,12 +2906,17 @@ if (!granted) {
     const isGroupChat = selectedChat.kind === 'group';
     const liveChat = chats.find(chat => isGroupChat
       ? chat.kind === 'group' && chat.id === selectedChat.id
-      : chat.endpointId === selectedChat.endpointId
+      : (selectedChat.profileId && chat.profileId === selectedChat.profileId)
+        || (selectedChat.endpointId && chat.endpointId === selectedChat.endpointId)
     ) || selectedChat;
     const groupRecipients = isGroupChat ? getGroupRecipients(liveChat) : [];
+    const directConnected = !isGroupChat && connectedDevices.some(device => device.endpointId === liveChat.endpointId);
+    const meshRouteAvailable = connectedDevices.length > 0 && (isGroupChat
+      ? getGroupMemberIds(liveChat).some(id => meshPeersRef.current.has(profileKey(id)) && profileKey(id) !== profileKey(profileId))
+      : Boolean(liveChat.profileId && meshPeersRef.current.has(liveChat.profileId)));
     const connected = isGroupChat
-      ? groupRecipients.length > 0
-      : connectedDevices.some(device => device.endpointId === liveChat.endpointId);
+      ? meshRouteAvailable
+      : directConnected || meshRouteAvailable;
     const groupMemberCount = Math.max(0, (liveChat.memberNames || []).length - 1);
     const messages = liveChat.messages || [];
 
@@ -2471,7 +2926,7 @@ if (!granted) {
           <IconButton name="arrow-back" size={23} onPress={closeChat} />
           <Avatar
             initials={liveChat.initials || getInitials(liveChat.name)}
-            color={liveChat.color || '#304B77'}
+            color={liveChat.color || '#607844'}
             size={42}
             online={connected}
           />
@@ -2479,8 +2934,8 @@ if (!granted) {
             <Text style={styles.chatScreenName}>{liveChat.name || 'Nearby device'}</Text>
             <Text style={styles.chatScreenStatus}>
               {isGroupChat
-                ? `Text group · ${groupRecipients.length}/${groupMemberCount} members nearby`
-                : connected ? 'Connected • Offline messaging' : 'Not connected'}
+                ? `Group · ${groupRecipients.length}/${groupMemberCount} nearby`
+                : directConnected ? 'Connected nearby' : meshRouteAvailable ? 'Connected through mesh' : 'Not connected'}
             </Text>
           </View>
           <IconButton
@@ -2493,7 +2948,7 @@ if (!granted) {
         <View style={styles.chatScreenBody}>
           <View style={styles.chatEncryptionBadge}>
             <Ionicons name="shield-checkmark-outline" size={17} color={COLORS.green} />
-            <Text style={styles.chatEncryptionText}>Nearby device connection</Text>
+            <Text style={styles.chatEncryptionText}>Text encrypted end-to-end</Text>
           </View>
 
           <ScrollView
@@ -2547,7 +3002,7 @@ if (!granted) {
                     </Text>
                     {message.sender === 'me' ? (
                       <Text style={[styles.messageStatus, message.status === 'partial' && styles.messageStatusPartial]}>
-                        {message.status === 'failed' ? 'Failed' : message.status === 'partial' ? 'Partial' : message.status === 'sending' ? 'Sending…' : 'Sent'}
+                        {message.status === 'failed' ? 'Failed' : message.status === 'partial' ? 'Partial' : message.status === 'sending' ? 'Sending…' : message.status === 'sent' && !message.type ? 'Forwarded' : 'Sent'}
                       </Text>
                     ) : null}
                   </View>
@@ -2564,12 +3019,14 @@ if (!granted) {
                       <Ionicons name="share-outline" size={15} color={COLORS.primary} />
                     </TouchableOpacity>
                   ) : null}
-                  {message.sender === 'me' && message.status === 'failed' ? (
+                    {message.sender === 'me' && ['failed', 'partial'].includes(message.status) ? (
                     <TouchableOpacity
                       style={styles.messageActionButton}
                       accessibilityRole="button"
                       accessibilityLabel="Retry sending message"
-                      onPress={() => retryChatMessage(liveChat.endpointId, message)}
+                      onPress={() => isGroupChat
+                        ? retryGroupMessage(liveChat, message)
+                        : retryChatMessage(liveChat.profileId || liveChat.endpointId, message)}
                       activeOpacity={0.7}
                     >
                       <Ionicons name="refresh" size={15} color={COLORS.primary} />
@@ -2579,7 +3036,7 @@ if (!granted) {
                     style={styles.messageActionButton}
                     accessibilityRole="button"
                     accessibilityLabel="Delete message from this phone"
-                    onPress={() => deleteChatMessage(liveChat.endpointId, message.id)}
+                      onPress={() => deleteChatMessage(liveChat, message.id)}
                     activeOpacity={0.7}
                   >
                     <Ionicons name="trash-outline" size={15} color={COLORS.muted} />
@@ -2597,23 +3054,23 @@ if (!granted) {
             accessibilityRole="button"
             accessibilityLabel="Attach a file"
             onPress={pickChatFile}
-            disabled={!connected || isRecordingVoice || isGroupChat}
+            disabled={!directConnected || isRecordingVoice || isGroupChat}
             activeOpacity={0.75}
           >
-            <Ionicons name="attach-outline" size={20} color={connected && !isGroupChat ? COLORS.muted : COLORS.border} />
+            <Ionicons name="attach-outline" size={20} color={directConnected && !isGroupChat ? COLORS.muted : COLORS.border} />
           </TouchableOpacity>
           <TouchableOpacity
             style={[styles.chatToolButton, isRecordingVoice && styles.chatToolButtonRecording]}
             accessibilityRole="button"
             accessibilityLabel={isRecordingVoice ? 'Stop recording voice message' : 'Record voice message'}
             onPress={toggleVoiceRecording}
-            disabled={(!connected || isGroupChat) && !isRecordingVoice}
+            disabled={(!directConnected || isGroupChat) && !isRecordingVoice}
             activeOpacity={0.75}
           >
             <Ionicons
               name={isRecordingVoice ? 'stop' : 'mic-outline'}
               size={18}
-              color={isRecordingVoice ? '#FF9B9B' : connected && !isGroupChat ? COLORS.muted : COLORS.border}
+              color={isRecordingVoice ? '#FF9B9B' : directConnected && !isGroupChat ? COLORS.muted : COLORS.border}
             />
           </TouchableOpacity>
           <View style={styles.chatComposerInput}>
@@ -2649,26 +3106,31 @@ if (!granted) {
         name: 'Home',
         icon: 'home-outline',
         activeIcon: 'home',
+        color: COLORS.primary,
       },
       {
         name: 'Nearby',
         icon: 'radio-outline',
         activeIcon: 'radio',
+        color: COLORS.cyan,
       },
       {
         name: 'Chats',
         icon: 'chatbubbles-outline',
         activeIcon: 'chatbubbles',
+        color: COLORS.blue,
       },
       {
         name: 'Requests',
         icon: 'people-outline',
         activeIcon: 'people',
+        color: COLORS.pink,
       },
       {
         name: 'Profile',
         icon: 'person-outline',
         activeIcon: 'person',
+        color: COLORS.violet,
       },
     ];
 
@@ -2681,6 +3143,9 @@ if (!granted) {
             <TouchableOpacity
               key={tab.name}
               style={styles.navItem}
+              accessibilityRole="button"
+              accessibilityLabel={`${tab.name} tab`}
+              accessibilityState={{ selected: active }}
               onPress={() => {
                 setSelectedChat(null);
                 setActiveTab(tab.name);
@@ -2691,13 +3156,13 @@ if (!granted) {
               <View
                 style={[
                   styles.navIconWrapper,
-                  active && styles.navIconWrapperActive,
+                  active && { backgroundColor: `${tab.color}22` },
                 ]}
               >
                 <Ionicons
                   name={active ? tab.activeIcon : tab.icon}
                   size={21}
-                  color={active ? COLORS.primary : COLORS.muted}
+                  color={active ? tab.color : COLORS.muted}
                 />
 
                 {tab.name === 'Requests' && requests.length > 0 && (
@@ -2708,7 +3173,7 @@ if (!granted) {
               <Text
                 style={[
                   styles.navLabel,
-                  active && styles.navLabelActive,
+                  active && { color: tab.color, fontWeight: '800' },
                 ]}
               >
                 {tab.name}
@@ -2756,25 +3221,123 @@ if (!granted) {
         backgroundColor={COLORS.background}
       />
 
-      {renderHeader()}
-
-      <View style={styles.mainContent}>
-        {selectedChat
-          ? renderChatScreen()
-          : activeTab === 'Home'
-            ? renderHome()
-            : activeTab === 'Nearby'
-              ? renderNearby()
-              : activeTab === 'Chats'
-                ? renderChats()
-                : activeTab === 'Requests'
-                  ? renderRequests()
-                  : renderProfile()}
+      <View style={styles.pageBlurTarget}>
+        {renderHeader()}
+        <View style={styles.mainContent}>
+          {selectedChat
+            ? renderChatScreen()
+            : activeTab === 'Home'
+              ? renderHome()
+              : activeTab === 'Nearby'
+                ? renderNearby()
+                : activeTab === 'Chats'
+                  ? renderChats()
+                  : activeTab === 'Requests'
+                    ? renderRequests()
+                    : renderProfile()}
+        </View>
       </View>
 
       {!selectedChat && renderBottomNavigation()}
 
       {renderNotice()}
+
+      <Modal
+        visible={isQrScannerOpen}
+        animationType="slide"
+        onRequestClose={() => setIsQrScannerOpen(false)}
+      >
+        <View style={styles.qrScannerScreen}>
+          <View style={styles.qrModalHeader}>
+            <View>
+              <Text style={styles.qrModalEyebrow}>SECURE CONNECTION</Text>
+              <Text style={styles.qrModalTitle}>Scan connection QR</Text>
+            </View>
+            <IconButton name="close" onPress={() => setIsQrScannerOpen(false)} />
+          </View>
+          <Text style={styles.qrModalDescription}>
+            Verify identity once. Tap Connect nearby later; saved devices skip code confirmation.
+          </Text>
+          <View style={styles.cameraFrame}>
+            <CameraView
+              style={styles.cameraPreview}
+              active={isQrScannerOpen}
+              facing="back"
+              barcodeScannerSettings={{ barcodeTypes: ['qr'] }}
+              onBarcodeScanned={handleConnectionQrScanned}
+              onCameraReady={() => {
+                setCameraMountError('');
+                setIsCameraReady(true);
+              }}
+              onMountError={event => {
+                setCameraMountError(event.message || 'Camera preview could not start.');
+                setIsCameraReady(false);
+              }}
+            />
+            {!isCameraReady && !cameraMountError ? (
+              <View pointerEvents="none" style={styles.cameraMessageOverlay}>
+                <Text style={styles.cameraMessageText}>Starting camera…</Text>
+              </View>
+            ) : null}
+            {cameraMountError ? (
+              <View style={styles.cameraErrorOverlay}>
+                <Ionicons name="camera-outline" size={25} color={COLORS.text} />
+                <Text style={styles.cameraMessageText}>{cameraMountError}</Text>
+                <TouchableOpacity
+                  style={styles.cameraRetryButton}
+                  onPress={() => {
+                    setCameraMountError('');
+                    setIsCameraReady(false);
+                    setIsQrScannerOpen(false);
+                    setTimeout(() => setIsQrScannerOpen(true), 150);
+                  }}
+                >
+                  <Text style={styles.cameraRetryText}>Try again</Text>
+                </TouchableOpacity>
+              </View>
+            ) : null}
+            <View pointerEvents="none" style={styles.cameraScanOutline} />
+          </View>
+          <Text style={styles.cameraHint}>Keep the QR inside the frame</Text>
+        </View>
+      </Modal>
+
+      <Modal
+        visible={isMyQrOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setIsMyQrOpen(false)}
+      >
+        <View style={styles.profileSetupBackdrop}>
+          <ScrollView
+            style={styles.qrModalScroll}
+            contentContainerStyle={styles.qrModalScrollContent}
+            showsVerticalScrollIndicator={false}
+            bounces={false}
+          >
+            <View style={styles.myQrModal}>
+              <View style={styles.qrModalHeader}>
+                <View style={styles.qrModalHeadingCopy}>
+                  <Text style={styles.qrModalEyebrow}>SHARE TO CONNECT</Text>
+                  <Text style={styles.qrModalTitle}>Your connection QR</Text>
+                </View>
+                <IconButton name="close" onPress={() => setIsMyQrOpen(false)} />
+              </View>
+              <Text style={styles.qrModalDescription}>
+                Let someone scan this code, then both phones can find each other using nearby discovery.
+              </Text>
+              {getConnectionQrValue() ? (
+                <View style={[styles.qrCodePaper, { width: qrCodeSize + 32, height: qrCodeSize + 32 }]}>
+                  <QRCode value={getConnectionQrValue()} size={qrCodeSize} color="#081018" backgroundColor="#FFFFFF" />
+                </View>
+              ) : (
+                <Text style={styles.qrModalDescription}>Your secure profile is still being prepared.</Text>
+              )}
+              <Text style={styles.qrOwnerName}>{getPublicDisplayName()}</Text>
+            </View>
+          </ScrollView>
+        </View>
+      </Modal>
 
       <Modal
         visible={isProfileSetupVisible}
@@ -2787,15 +3350,15 @@ if (!granted) {
             <View style={styles.profileSetupIcon}>
               <Ionicons name="person-add-outline" size={24} color={COLORS.text} />
             </View>
-            <Text style={styles.profileSetupTitle}>Set up your profile</Text>
+            <Text style={styles.profileSetupTitle}>Welcome to ChatHub</Text>
             <Text style={styles.profileSetupDescription}>
-              Choose a name, or use your generated ID as your display name. Your unique ID stays the same either way.
+              Add your first name so nearby people can recognize you. You can change it later in Profile.
             </Text>
             <TextInput
               style={styles.profileSetupInput}
               value={profileSetupName}
               onChangeText={setProfileSetupName}
-              placeholder="Your name"
+              placeholder="First name"
               placeholderTextColor={COLORS.muted}
               maxLength={30}
               autoCapitalize="words"
@@ -2815,7 +3378,7 @@ if (!granted) {
                 disabled={!profileSetupName.trim()}
                 activeOpacity={0.8}
               >
-                <Text style={styles.profileSetupSaveText}>Save name</Text>
+                <Text style={styles.profileSetupSaveText}>Continue</Text>
               </TouchableOpacity>
             </View>
             <Text style={styles.profileSetupId}>ID: {getFullProfileId()}</Text>
@@ -2830,10 +3393,14 @@ if (!granted) {
     backgroundColor: COLORS.background,
   },
 
+  pageBlurTarget: {
+    flex: 1,
+  },
+
   header: {
-    minHeight: 76,
+    minHeight: 72,
     paddingHorizontal: 20,
-    paddingVertical: 14,
+    paddingVertical: 13,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
@@ -2849,9 +3416,9 @@ if (!granted) {
   },
 
   brandIcon: {
-    width: 44,
-    height: 44,
-    borderRadius: 15,
+    width: 46,
+    height: 46,
+    borderRadius: 16,
     alignItems: 'center',
     justifyContent: 'center',
     backgroundColor: COLORS.primary,
@@ -2861,14 +3428,14 @@ if (!granted) {
     color: COLORS.text,
     fontSize: 21,
     fontWeight: '800',
-    letterSpacing: -0.6,
+    letterSpacing: -0.5,
   },
 
   brandSubtitle: {
     color: COLORS.muted,
     fontSize: 9,
     fontWeight: '800',
-    letterSpacing: 1.7,
+    letterSpacing: 1.35,
     marginTop: 3,
   },
 
@@ -2884,9 +3451,9 @@ if (!granted) {
     gap: 5,
     paddingHorizontal: 10,
     paddingVertical: 7,
-    backgroundColor: '#102A29',
+    backgroundColor: 'rgba(184,243,107,0.09)',
     borderWidth: 1,
-    borderColor: '#1E4943',
+    borderColor: 'rgba(184,243,107,0.2)',
     borderRadius: 20,
   },
 
@@ -2915,40 +3482,42 @@ if (!granted) {
   },
 
   greetingContainer: {
-    marginBottom: 24,
-  },
-
-  greetingEyebrow: {
-    color: COLORS.primary,
-    fontSize: 10,
-    fontWeight: '800',
-    letterSpacing: 2,
-    marginBottom: 9,
+    marginBottom: 20,
   },
 
   greetingTitle: {
     color: COLORS.text,
-    fontSize: 29,
+    fontSize: 31,
     fontWeight: '800',
     letterSpacing: -0.8,
   },
 
-  greetingDescription: {
-    color: COLORS.muted,
+  greetingEyebrow: {
+    color: COLORS.primary,
     fontSize: 13,
-    lineHeight: 20,
-    marginTop: 7,
+    fontWeight: '700',
+    marginBottom: 3,
+  },
+
+  greetingSubtitle: {
+    color: COLORS.muted,
+    fontSize: 12,
+    marginTop: 4,
   },
 
   scannerCard: {
-    backgroundColor: '#101D36',
+    backgroundColor: '#101D27',
     borderWidth: 1,
-    borderColor: '#2A4169',
+    borderColor: 'rgba(184,243,107,0.24)',
     borderRadius: 24,
-    padding: 20,
-    marginBottom: 20,
+    padding: 18,
+    marginBottom: 18,
     overflow: 'hidden',
-    elevation: 4,
+    shadowColor: '#000000',
+    shadowOffset: { width: 0, height: 12 },
+    shadowOpacity: 0.22,
+    shadowRadius: 20,
+    elevation: 7,
   },
 
   scannerCardTop: {
@@ -2962,75 +3531,63 @@ if (!granted) {
     flex: 1,
   },
 
-  scannerLabelRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 7,
-    marginBottom: 12,
-  },
-
-  liveDot: {
-    width: 7,
-    height: 7,
-    borderRadius: 4,
-    backgroundColor: COLORS.green,
-  },
-
-  scannerEyebrow: {
-    color: '#A8B9E0',
-    fontSize: 9,
-    fontWeight: '800',
-    letterSpacing: 1.4,
-  },
-
   scannerTitle: {
     color: COLORS.text,
-    fontSize: 23,
+    fontSize: 22,
     fontWeight: '800',
     letterSpacing: -0.5,
   },
 
   scannerDescription: {
-    color: '#A1B0CC',
+    color: COLORS.muted,
     fontSize: 12,
-    lineHeight: 18,
-    marginTop: 8,
-    maxWidth: 235,
+    lineHeight: 17,
+    marginTop: 7,
   },
 
   scannerVisual: {
+    position: 'relative',
     alignItems: 'center',
     justifyContent: 'center',
-    width: 90,
-    height: 105,
+    width: 98,
+    height: 98,
+  },
+
+  scannerPulseRing: {
+    position: 'absolute',
+    width: 68,
+    height: 68,
+    borderRadius: 34,
+    borderWidth: 1.5,
+    borderColor: COLORS.green,
   },
 
   scannerCircleOuter: {
-    width: 88,
-    height: 88,
-    borderRadius: 44,
+    width: 74,
+    height: 74,
+    borderRadius: 37,
     borderWidth: 1,
-    borderColor: '#405C91',
-    backgroundColor: '#17294A',
+    borderColor: '#355044',
+    backgroundColor: '#102129',
     alignItems: 'center',
     justifyContent: 'center',
   },
 
   scannerCircleMiddle: {
-    width: 67,
-    height: 67,
-    borderRadius: 34,
+    width: 56,
+    height: 56,
+    borderRadius: 28,
     borderWidth: 1,
-    borderColor: '#5776B4',
-    backgroundColor: '#203962',
+    borderColor: 'rgba(131,223,200,0.55)',
+    backgroundColor: 'rgba(131,223,200,0.14)',
     alignItems: 'center',
     justifyContent: 'center',
   },
 
   scannerCircleInner: {
-    width: 46,
-    height: 46,
-    borderRadius: 23,
+    width: 38,
+    height: 38,
+    borderRadius: 19,
     backgroundColor: COLORS.primary,
     alignItems: 'center',
     justifyContent: 'center',
@@ -3038,17 +3595,22 @@ if (!granted) {
 
   scannerDivider: {
     height: 1,
-    backgroundColor: '#2A4169',
-    marginTop: 21,
-    marginBottom: 17,
+    backgroundColor: COLORS.border,
+    marginTop: 16,
+    marginBottom: 14,
   },
 
   scannerBottom: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: 10,
+    flexDirection: 'column',
+    alignItems: 'stretch',
+    gap: 12,
     flexWrap: 'wrap',
+  },
+
+  scannerActionRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
   },
 
   scannerStatus: {
@@ -3059,48 +3621,173 @@ if (!granted) {
   },
 
   scannerStatusText: {
-    color: '#B5C3DF',
+    color: COLORS.muted,
     fontSize: 11,
     fontWeight: '600',
   },
 
   scanButton: {
+    minHeight: 46,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
     gap: 7,
     backgroundColor: COLORS.primary,
-    borderRadius: 12,
-    paddingHorizontal: 14,
-    paddingVertical: 11,
+    borderRadius: 16,
+    paddingHorizontal: 17,
+    paddingVertical: 12,
+  },
+
+  qrActionButton: {
+    minHeight: 46,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    paddingHorizontal: 11,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: 'rgba(184,243,107,0.25)',
+    backgroundColor: 'rgba(255,255,255,0.055)',
+  },
+
+  qrActionText: {
+    color: COLORS.text,
+    fontSize: 11,
+    fontWeight: '700',
+  },
+
+  qrConnectCard: {
+    marginTop: -10,
+    marginBottom: 26,
+    padding: 16,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surface,
+  },
+
+  qrConnectHeading: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+
+  qrConnectIcon: {
+    width: 42,
+    height: 42,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 13,
+    backgroundColor: 'rgba(184,243,107,0.1)',
+  },
+
+  qrConnectCopy: {
+    flex: 1,
+  },
+
+  qrConnectTitle: {
+    color: COLORS.text,
+    fontSize: 14,
+    fontWeight: '800',
+  },
+
+  qrConnectDescription: {
+    color: COLORS.muted,
+    fontSize: 12,
+    lineHeight: 18,
+    marginTop: 3,
+  },
+
+  qrConnectActions: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 9,
+    marginTop: 15,
   },
 
   scanButtonActive: {
-    backgroundColor: '#244E48',
+    backgroundColor: '#1A282D',
     borderWidth: 1,
-    borderColor: '#357D70',
+    borderColor: COLORS.green,
   },
 
   scanButtonText: {
-    color: COLORS.text,
+    color: COLORS.background,
     fontSize: 12,
     fontWeight: '800',
+  },
+
+  scanButtonTextActive: {
+    color: COLORS.text,
   },
 
   statsContainer: {
     flexDirection: 'row',
     gap: 11,
-    marginBottom: 29,
+    marginBottom: 22,
+  },
+
+  homeQuickActions: {
+    flexDirection: 'row',
+    gap: 10,
+    marginBottom: 20,
+  },
+
+  homeQuickAction: {
+    flex: 1,
+    minWidth: 0,
+    minHeight: 67,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+    borderRadius: 16,
+    backgroundColor: COLORS.surface,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+
+  homeQuickIcon: {
+    width: 36,
+    height: 36,
+    flexShrink: 0,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 12,
+  },
+
+  homeQuickCopy: {
+    flex: 1,
+    minWidth: 0,
+  },
+
+  homeQuickTitle: {
+    color: COLORS.text,
+    fontSize: 11,
+    fontWeight: '800',
+  },
+
+  homeQuickSubtitle: {
+    color: COLORS.muted,
+    fontSize: 9,
+    marginTop: 4,
   },
 
   statCard: {
     flex: 1,
     minWidth: 0,
-    padding: 13,
+    padding: 14,
     borderRadius: 18,
-    backgroundColor: COLORS.surface,
+    backgroundColor: '#111D26',
     borderWidth: 1,
-    borderColor: COLORS.border,
+    borderColor: '#293A46',
+    shadowColor: '#000000',
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.12,
+    shadowRadius: 12,
+    elevation: 3,
   },
 
   statIcon: {
@@ -3120,7 +3807,7 @@ if (!granted) {
 
   statLabel: {
     color: COLORS.muted,
-    fontSize: 10,
+    fontSize: 11,
     marginTop: 4,
     fontWeight: '600',
   },
@@ -3135,26 +3822,28 @@ if (!granted) {
 
   sectionTitle: {
     color: COLORS.text,
-    fontSize: 17,
+    fontSize: 18,
     fontWeight: '800',
     letterSpacing: -0.3,
   },
 
   sectionAction: {
     color: COLORS.primary,
-    fontSize: 12,
+    fontSize: 13,
+    paddingVertical: 8,
+    paddingHorizontal: 6,
     fontWeight: '700',
   },
 
   deviceRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    padding: 13,
+    padding: 14,
     backgroundColor: COLORS.surface,
     borderWidth: 1,
     borderColor: COLORS.border,
-    borderRadius: 17,
-    marginBottom: 11,
+    borderRadius: 18,
+    marginBottom: 12,
   },
 
   avatar: {
@@ -3185,13 +3874,13 @@ if (!granted) {
 
   deviceName: {
     color: COLORS.text,
-    fontSize: 14,
+    fontSize: 15,
     fontWeight: '700',
   },
 
   deviceSubtitle: {
     color: COLORS.muted,
-    fontSize: 11,
+    fontSize: 12,
     marginTop: 5,
     lineHeight: 16,
   },
@@ -3223,13 +3912,13 @@ if (!granted) {
 
   compactEmptyTitle: {
     color: COLORS.text,
-    fontSize: 12,
+    fontSize: 14,
     fontWeight: '700',
   },
 
   compactEmptyDescription: {
     color: COLORS.muted,
-    fontSize: 10,
+    fontSize: 12,
     marginTop: 5,
     lineHeight: 15,
   },
@@ -3237,8 +3926,9 @@ if (!granted) {
   chatRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingVertical: 13,
-    borderBottomWidth: 1,
+    minHeight: 78,
+    paddingVertical: 10,
+    borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: COLORS.border,
   },
 
@@ -3257,20 +3947,37 @@ if (!granted) {
 
   chatName: {
     color: COLORS.text,
-    fontSize: 13,
-    fontWeight: '700',
+    fontSize: 15,
+    fontWeight: '750',
     flexShrink: 1,
   },
 
   chatTime: {
     color: COLORS.muted,
     fontSize: 10,
+    marginLeft: 6,
+  },
+
+  chatTimeUnread: {
+    color: COLORS.primary,
+    fontWeight: '700',
+  },
+
+  chatPreviewRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 5,
   },
 
   chatPreview: {
     color: COLORS.muted,
-    fontSize: 11,
-    marginTop: 6,
+    fontSize: 12,
+    flex: 1,
+  },
+
+  chatPreviewUnread: {
+    color: COLORS.text,
+    fontWeight: '600',
   },
 
   unreadBadge: {
@@ -3289,54 +3996,11 @@ if (!granted) {
     fontWeight: '800',
   },
 
-  securityBanner: {
+  pageHeading: {
     flexDirection: 'row',
     alignItems: 'center',
-    padding: 15,
-    backgroundColor: '#102320',
-    borderWidth: 1,
-    borderColor: '#23453E',
-    borderRadius: 17,
-    marginTop: 27,
-  },
-
-  securityBannerIcon: {
-    width: 42,
-    height: 42,
-    borderRadius: 13,
-    backgroundColor: '#18352F',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-
-  securityBannerContent: {
-    flex: 1,
-    marginLeft: 12,
-  },
-
-  securityBannerTitle: {
-    color: COLORS.text,
-    fontSize: 12,
-    fontWeight: '800',
-  },
-
-  securityBannerDescription: {
-    color: '#A4BDB5',
-    fontSize: 10,
-    lineHeight: 15,
-    marginTop: 5,
-  },
-
-  pageHeading: {
-    marginBottom: 23,
-  },
-
-  pageEyebrow: {
-    color: COLORS.primary,
-    fontSize: 10,
-    fontWeight: '800',
-    letterSpacing: 2,
-    marginBottom: 9,
+    justifyContent: 'space-between',
+    marginBottom: 24,
   },
 
   pageTitle: {
@@ -3346,15 +4010,63 @@ if (!granted) {
     letterSpacing: -0.8,
   },
 
-  pageDescription: {
+  chatPageSubtitle: {
     color: COLORS.muted,
     fontSize: 12,
-    lineHeight: 19,
-    marginTop: 7,
+    marginTop: 4,
+  },
+
+  chatFiltersScroll: {
+    flexGrow: 0,
+    marginTop: -7,
+    marginBottom: 12,
+  },
+
+  chatFilters: {
+    flexDirection: 'row',
+    gap: 9,
+    paddingBottom: 2,
+  },
+
+  chatFilterChip: {
+    minHeight: 36,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 7,
+    paddingHorizontal: 14,
+    borderRadius: 18,
+    backgroundColor: COLORS.surface,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+
+  chatFilterChipActive: {
+    backgroundColor: 'rgba(184,243,107,0.14)',
+    borderColor: 'rgba(184,243,107,0.5)',
+  },
+
+  chatFilterText: {
+    color: COLORS.muted,
+    fontSize: 12,
+    fontWeight: '700',
+  },
+
+  chatFilterTextActive: {
+    color: COLORS.primary,
+  },
+
+  chatFilterCount: {
+    color: COLORS.muted,
+    fontSize: 10,
+    fontWeight: '700',
+  },
+
+  chatList: {
+    marginTop: 2,
   },
 
   searchBar: {
-    minHeight: 51,
+    minHeight: 54,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
@@ -3362,15 +4074,20 @@ if (!granted) {
     backgroundColor: COLORS.surface,
     borderWidth: 1,
     borderColor: COLORS.border,
-    borderRadius: 15,
+    borderRadius: 17,
     marginBottom: 21,
+    shadowColor: '#000000',
+    shadowOffset: { width: 0, height: 5 },
+    shadowOpacity: 0.1,
+    shadowRadius: 10,
+    elevation: 2,
   },
 
   searchInput: {
     flex: 1,
     minWidth: 0,
     color: COLORS.text,
-    fontSize: 12,
+    fontSize: 14,
     paddingVertical: 12,
   },
 
@@ -3379,8 +4096,8 @@ if (!granted) {
     alignItems: 'center',
     justifyContent: 'space-between',
     gap: 10,
-    padding: 15,
-    borderRadius: 18,
+    padding: 16,
+    borderRadius: 20,
     backgroundColor: COLORS.surface,
     borderWidth: 1,
     borderColor: COLORS.border,
@@ -3398,13 +4115,13 @@ if (!granted) {
     width: 46,
     height: 46,
     borderRadius: 14,
-    backgroundColor: '#1A2743',
+    backgroundColor: 'rgba(98,216,232,0.12)',
     alignItems: 'center',
     justifyContent: 'center',
   },
 
   discoveryStatusIconActive: {
-    backgroundColor: '#15342F',
+    backgroundColor: 'rgba(98,216,232,0.2)',
   },
 
   discoveryStatusText: {
@@ -3414,14 +4131,14 @@ if (!granted) {
 
   discoveryStatusTitle: {
     color: COLORS.text,
-    fontSize: 12,
+    fontSize: 14,
     fontWeight: '800',
   },
 
   discoveryStatusSubtitle: {
     color: COLORS.muted,
-    fontSize: 10,
-    lineHeight: 15,
+    fontSize: 12,
+    lineHeight: 17,
     marginTop: 5,
   },
 
@@ -3432,11 +4149,11 @@ if (!granted) {
     paddingHorizontal: 8,
     paddingVertical: 6,
     borderRadius: 20,
-    backgroundColor: '#252B3A',
+    backgroundColor: '#201E27',
   },
 
   statusPillActive: {
-    backgroundColor: '#15342F',
+    backgroundColor: '#1A282D',
   },
 
   statusPillDot: {
@@ -3461,20 +4178,214 @@ if (!granted) {
     color: COLORS.green,
   },
 
+  nearbyPageSubtitle: {
+    color: COLORS.muted,
+    fontSize: 12,
+    marginTop: 4,
+  },
+
+  radarCard: {
+    alignItems: 'center',
+    paddingHorizontal: 14,
+    paddingTop: 18,
+    paddingBottom: 15,
+    marginBottom: 18,
+    borderRadius: 25,
+    backgroundColor: COLORS.surface,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    overflow: 'hidden',
+  },
+
+  radarHeading: {
+    width: '100%',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 4,
+    marginBottom: 10,
+  },
+
+  radarTitle: {
+    color: COLORS.text,
+    fontSize: 16,
+    fontWeight: '800',
+  },
+
+  radarSubtitle: {
+    color: COLORS.muted,
+    fontSize: 11,
+    marginTop: 4,
+  },
+
+  radarSignalIcon: {
+    width: 38,
+    height: 38,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 13,
+    backgroundColor: 'rgba(184,243,107,0.1)',
+  },
+
+  radarCanvas: {
+    position: 'relative',
+    alignItems: 'center',
+    justifyContent: 'center',
+    alignSelf: 'center',
+    marginVertical: 3,
+    borderRadius: 999,
+    backgroundColor: '#0B1720',
+    borderWidth: 1,
+    borderColor: 'rgba(184,243,107,0.18)',
+    overflow: 'hidden',
+  },
+
+  radarRing: {
+    position: 'absolute',
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: 'rgba(184,243,107,0.16)',
+  },
+
+  radarRingOuter: {
+    width: '88%',
+    height: '88%',
+  },
+
+  radarRingMiddle: {
+    width: '62%',
+    height: '62%',
+  },
+
+  radarRingInner: {
+    width: '34%',
+    height: '34%',
+  },
+
+  radarCrosshairVertical: {
+    position: 'absolute',
+    width: 1,
+    height: '100%',
+    backgroundColor: 'rgba(184,243,107,0.08)',
+  },
+
+  radarCrosshairHorizontal: {
+    position: 'absolute',
+    width: '100%',
+    height: 1,
+    backgroundColor: 'rgba(184,243,107,0.08)',
+  },
+
+  radarPulseRing: {
+    position: 'absolute',
+    width: '72%',
+    height: '72%',
+    borderRadius: 999,
+    borderWidth: 2,
+    borderColor: COLORS.primary,
+    backgroundColor: 'rgba(184,243,107,0.035)',
+  },
+
+  radarCenter: {
+    width: 58,
+    height: 58,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 29,
+    backgroundColor: COLORS.primary,
+    borderWidth: 5,
+    borderColor: 'rgba(184,243,107,0.2)',
+    zIndex: 2,
+  },
+
+  radarDeviceMarker: {
+    position: 'absolute',
+    zIndex: 3,
+    alignItems: 'center',
+    width: 66,
+  },
+
+  radarDeviceDot: {
+    width: 27,
+    height: 27,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 14,
+    backgroundColor: COLORS.cyan,
+    borderWidth: 2,
+    borderColor: '#D8FFFF',
+    shadowColor: COLORS.cyan,
+    shadowOpacity: 0.45,
+    shadowRadius: 8,
+    elevation: 4,
+  },
+
+  radarDeviceLabel: {
+    maxWidth: 66,
+    color: COLORS.text,
+    fontSize: 9,
+    fontWeight: '700',
+    textAlign: 'center',
+    marginTop: 3,
+    paddingHorizontal: 4,
+    borderRadius: 5,
+    backgroundColor: 'rgba(7,17,27,0.82)',
+  },
+
+  radarScanButton: {
+    width: '100%',
+    minHeight: 49,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    marginTop: 12,
+    borderRadius: 15,
+    backgroundColor: COLORS.primary,
+  },
+
+  radarScanButtonActive: {
+    backgroundColor: '#1B2B2D',
+    borderWidth: 1,
+    borderColor: COLORS.primary,
+  },
+
+  radarScanButtonText: {
+    color: COLORS.background,
+    fontSize: 13,
+    fontWeight: '800',
+  },
+
+  radarScanButtonTextActive: {
+    color: COLORS.text,
+  },
+
+  radarPrivacyNote: {
+    color: COLORS.muted,
+    fontSize: 9,
+    textAlign: 'center',
+    marginTop: 10,
+  },
+
   primaryButton: {
-    minHeight: 51,
+    minHeight: 54,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
     gap: 9,
     backgroundColor: COLORS.primary,
-    borderRadius: 15,
+    borderRadius: 17,
     marginBottom: 27,
+    shadowColor: COLORS.primary,
+    shadowOffset: { width: 0, height: 7 },
+    shadowOpacity: 0.18,
+    shadowRadius: 14,
+    elevation: 4,
   },
 
   primaryButtonText: {
-    color: '#FFFFFF',
-    fontSize: 13,
+    color: '#1A1424',
+    fontSize: 14,
     fontWeight: '800',
   },
 
@@ -3485,8 +4396,8 @@ if (!granted) {
     backgroundColor: COLORS.surface,
     borderWidth: 1,
     borderColor: COLORS.border,
-    borderRadius: 17,
-    marginBottom: 11,
+    borderRadius: 18,
+    marginBottom: 12,
   },
 
   nearbyDeviceInfo: {
@@ -3503,16 +4414,17 @@ if (!granted) {
   },
 
   connectButton: {
-    paddingHorizontal: 12,
-    paddingVertical: 9,
+    minHeight: 44,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
     backgroundColor: COLORS.primary,
     borderRadius: 10,
     marginLeft: 8,
   },
 
   connectButtonText: {
-    color: '#FFFFFF',
-    fontSize: 11,
+    color: '#1A1424',
+    fontSize: 12,
     fontWeight: '800',
   },
 
@@ -3522,8 +4434,8 @@ if (!granted) {
   },
 
   deviceBlockButton: {
-    width: 36,
-    height: 36,
+    width: 44,
+    height: 44,
     alignItems: 'center',
     justifyContent: 'center',
     marginLeft: 4,
@@ -3536,7 +4448,7 @@ if (!granted) {
     paddingHorizontal: 9,
     paddingVertical: 7,
     borderRadius: 10,
-    backgroundColor: '#15342F',
+    backgroundColor: '#1A282D',
   },
 
   connectedPillText: {
@@ -3553,13 +4465,30 @@ if (!granted) {
     paddingBottom: 38,
   },
 
+  emptyStateCompact: {
+    paddingTop: 14,
+    paddingBottom: 14,
+  },
+
+  emptyIconCompact: {
+    width: 52,
+    height: 52,
+    borderRadius: 17,
+    marginBottom: 10,
+  },
+
+  emptyStateCompactDescription: {
+    fontSize: 12,
+    lineHeight: 18,
+  },
+
   emptyIcon: {
     width: 70,
     height: 70,
     borderRadius: 23,
-    backgroundColor: '#18233B',
+    backgroundColor: '#1B1921',
     borderWidth: 1,
-    borderColor: '#2A3C60',
+    borderColor: '#36313F',
     alignItems: 'center',
     justifyContent: 'center',
     marginBottom: 20,
@@ -3567,15 +4496,15 @@ if (!granted) {
 
   emptyTitle: {
     color: COLORS.text,
-    fontSize: 16,
+    fontSize: 18,
     fontWeight: '800',
     textAlign: 'center',
   },
 
   emptyDescription: {
     color: COLORS.muted,
-    fontSize: 12,
-    lineHeight: 19,
+    fontSize: 13,
+    lineHeight: 20,
     textAlign: 'center',
     marginTop: 9,
   },
@@ -3586,7 +4515,7 @@ if (!granted) {
     gap: 10,
     padding: 14,
     borderRadius: 15,
-    backgroundColor: '#111B2D',
+    backgroundColor: 'rgba(255,255,255,0.045)',
     borderWidth: 1,
     borderColor: COLORS.border,
     marginTop: 20,
@@ -3595,76 +4524,49 @@ if (!granted) {
   infoCardText: {
     flex: 1,
     color: COLORS.muted,
-    fontSize: 11,
-    lineHeight: 18,
+    fontSize: 12,
+    lineHeight: 19,
   },
 
   chatSummaryCard: {
     flexDirection: 'row',
-    alignItems: 'center',
-    padding: 16,
-    borderRadius: 18,
-    backgroundColor: COLORS.surface,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-    marginBottom: 20,
-  },
-
-  chatSummaryIcon: {
-    width: 46,
-    height: 46,
-    borderRadius: 14,
-    backgroundColor: '#1A2743',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-
-  chatSummaryContent: {
-    flex: 1,
-    marginLeft: 12,
-  },
-
-  chatSummaryTitle: {
-    color: COLORS.text,
-    fontSize: 13,
-    fontWeight: '800',
-  },
-
-  chatSummaryDescription: {
-    color: COLORS.muted,
-    fontSize: 11,
-    marginTop: 5,
+    justifyContent: 'flex-end',
+    marginBottom: 18,
   },
 
   newGroupButton: {
-    minHeight: 36,
+    minHeight: 40,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
     gap: 4,
-    paddingHorizontal: 9,
+    paddingHorizontal: 12,
     backgroundColor: COLORS.primary,
-    borderRadius: 9,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(184,243,107,0.38)',
   },
 
   newGroupButtonText: {
-    color: COLORS.text,
-    fontSize: 10,
+    color: COLORS.background,
+    fontSize: 12,
     fontWeight: '800',
   },
 
   groupModalBackdrop: {
     flex: 1,
     justifyContent: 'flex-end',
-    backgroundColor: 'rgba(0, 0, 0, 0.58)',
+    backgroundColor: 'rgba(7, 4, 14, 0.82)',
   },
 
   groupModal: {
-    maxHeight: '82%',
-    padding: 20,
-    backgroundColor: COLORS.surface,
-    borderTopLeftRadius: 16,
-    borderTopRightRadius: 16,
+    maxHeight: '88%',
+    paddingHorizontal: 20,
+    paddingTop: 22,
+    paddingBottom: Platform.OS === 'android' ? 28 : 34,
+    backgroundColor: '#14131A',
+    borderTopLeftRadius: 26,
+    borderTopRightRadius: 26,
     borderWidth: 1,
     borderColor: COLORS.border,
   },
@@ -3678,8 +4580,16 @@ if (!granted) {
 
   groupModalTitle: {
     color: COLORS.text,
-    fontSize: 18,
+    fontSize: 20,
     fontWeight: '800',
+  },
+
+  groupModalDescription: {
+    color: COLORS.muted,
+    fontSize: 12,
+    lineHeight: 18,
+    marginTop: 2,
+    marginBottom: 8,
   },
 
   groupNameInput: {
@@ -3703,7 +4613,7 @@ if (!granted) {
   },
 
   groupMemberList: {
-    maxHeight: 250,
+    maxHeight: 220,
   },
 
   groupMemberOption: {
@@ -3717,7 +4627,7 @@ if (!granted) {
   },
 
   groupMemberOptionSelected: {
-    backgroundColor: '#132C2B',
+    backgroundColor: '#1A282D',
   },
 
   groupMemberName: {
@@ -3763,6 +4673,8 @@ if (!granted) {
     justifyContent: 'center',
     backgroundColor: COLORS.primary,
     borderRadius: 10,
+    borderWidth: 1,
+    borderColor: 'rgba(184,243,107,0.38)',
   },
 
   groupCreateButtonDisabled: {
@@ -3770,60 +4682,7 @@ if (!granted) {
   },
 
   groupCreateButtonText: {
-    color: COLORS.text,
-    fontSize: 12,
-    fontWeight: '800',
-  },
-
-  requestSummaryCard: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    padding: 16,
-    backgroundColor: COLORS.surface,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-    borderRadius: 18,
-    marginBottom: 20,
-  },
-
-  requestSummaryIcon: {
-    width: 46,
-    height: 46,
-    borderRadius: 14,
-    backgroundColor: '#292342',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-
-  requestSummaryContent: {
-    flex: 1,
-    marginLeft: 12,
-  },
-
-  requestSummaryTitle: {
-    color: COLORS.text,
-    fontSize: 13,
-    fontWeight: '800',
-  },
-
-  requestSummaryDescription: {
-    color: COLORS.muted,
-    fontSize: 11,
-    marginTop: 5,
-  },
-
-  requestCountBadge: {
-    minWidth: 30,
-    height: 30,
-    borderRadius: 10,
-    backgroundColor: '#292342',
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingHorizontal: 8,
-  },
-
-  requestCountText: {
-    color: COLORS.purple,
+    color: COLORS.background,
     fontSize: 12,
     fontWeight: '800',
   },
@@ -3833,7 +4692,7 @@ if (!granted) {
     backgroundColor: COLORS.surface,
     borderWidth: 1,
     borderColor: COLORS.border,
-    borderRadius: 19,
+    borderRadius: 23,
     marginBottom: 13,
   },
 
@@ -3910,11 +4769,12 @@ if (!granted) {
     flexDirection: 'row',
     gap: 10,
     marginTop: 17,
+    flexWrap: 'wrap',
   },
 
   acceptButton: {
     flex: 1,
-    minHeight: 43,
+    minHeight: 46,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
@@ -3924,19 +4784,19 @@ if (!granted) {
   },
 
   acceptButtonText: {
-    color: '#071711',
+    color: '#1A1424',
     fontSize: 12,
     fontWeight: '800',
   },
 
   rejectButton: {
     flex: 1,
-    minHeight: 43,
+    minHeight: 46,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
     gap: 6,
-    backgroundColor: '#202B3D',
+    backgroundColor: '#201E27',
     borderWidth: 1,
     borderColor: COLORS.border,
     borderRadius: 12,
@@ -3950,7 +4810,7 @@ if (!granted) {
 
   blockButton: {
     flex: 1,
-    minHeight: 43,
+    minHeight: 46,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
@@ -3973,7 +4833,7 @@ if (!granted) {
     backgroundColor: COLORS.surface,
     borderWidth: 1,
     borderColor: COLORS.border,
-    borderRadius: 23,
+    borderRadius: 28,
     marginBottom: 25,
   },
 
@@ -3986,9 +4846,9 @@ if (!granted) {
     width: 91,
     height: 91,
     borderRadius: 30,
-    backgroundColor: '#304B77',
+    backgroundColor: '#607844',
     borderWidth: 3,
-    borderColor: '#415F93',
+    borderColor: '#7D9360',
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -4033,12 +4893,6 @@ if (!granted) {
     borderRadius: 10,
   },
 
-  profileSubtitle: {
-    color: COLORS.muted,
-    fontSize: 12,
-    marginTop: 7,
-  },
-
   profileIdBlock: {
     width: '100%',
     alignItems: 'center',
@@ -4058,6 +4912,29 @@ if (!granted) {
     letterSpacing: 1,
   },
 
+  profileIdentifierHeader: {
+    width: '100%',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+
+  copyIdentifierButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+    borderRadius: 8,
+    backgroundColor: COLORS.surface,
+  },
+
+  copyIdentifierText: {
+    color: COLORS.primary,
+    fontSize: 10,
+    fontWeight: '700',
+  },
+
   profileIdValue: {
     color: COLORS.green,
     fontSize: 10,
@@ -4073,6 +4950,22 @@ if (!granted) {
     marginTop: 5,
   },
 
+  profileIdDivider: {
+    width: '100%',
+    height: 1,
+    backgroundColor: COLORS.border,
+    marginVertical: 12,
+  },
+
+  meshFingerprint: {
+    color: COLORS.primary,
+    fontSize: 9,
+    fontWeight: '800',
+    textAlign: 'center',
+    letterSpacing: 0.4,
+    marginTop: 6,
+  },
+
   profileSetupBackdrop: {
     flex: 1,
     alignItems: 'center',
@@ -4081,15 +4974,170 @@ if (!granted) {
     backgroundColor: 'rgba(0, 0, 0, 0.66)',
   },
 
+  qrModalScroll: {
+    width: '100%',
+    flexGrow: 0,
+    maxHeight: '92%',
+  },
+
+  qrModalScrollContent: {
+    flexGrow: 1,
+    justifyContent: 'center',
+    paddingVertical: 6,
+  },
+
+  qrModalHeadingCopy: {
+    flex: 1,
+    minWidth: 0,
+  },
+
+  qrScannerScreen: {
+    flex: 1,
+    paddingTop: Platform.OS === 'android' ? 48 : 60,
+    paddingHorizontal: 22,
+    paddingBottom: 36,
+    backgroundColor: COLORS.background,
+  },
+
+  qrModalHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+  },
+
+  qrModalEyebrow: {
+    color: COLORS.green,
+    fontSize: 9,
+    fontWeight: '800',
+    letterSpacing: 1.3,
+  },
+
+  qrModalTitle: {
+    color: COLORS.text,
+    fontSize: 20,
+    fontWeight: '800',
+    marginTop: 5,
+  },
+
+  qrModalDescription: {
+    color: COLORS.muted,
+    fontSize: 13,
+    lineHeight: 20,
+    marginTop: 14,
+    textAlign: 'center',
+  },
+
+  cameraFrame: {
+    width: '100%',
+    aspectRatio: 1,
+    maxHeight: 380,
+    alignSelf: 'center',
+    overflow: 'hidden',
+    marginTop: 34,
+    borderRadius: 28,
+    borderWidth: 1,
+    borderColor: 'rgba(184,243,107,0.38)',
+    backgroundColor: '#111A20',
+  },
+
+  cameraScanOutline: {
+    position: 'absolute',
+    top: '17%',
+    right: '17%',
+    bottom: '17%',
+    left: '17%',
+    borderWidth: 2,
+    borderColor: COLORS.primary,
+    borderRadius: 22,
+  },
+
+  cameraPreview: {
+    flex: 1,
+    width: '100%',
+    height: '100%',
+  },
+
+  cameraMessageOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(13,9,23,0.78)',
+  },
+
+  cameraErrorOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 12,
+    padding: 24,
+    backgroundColor: 'rgba(13,9,23,0.94)',
+  },
+
+  cameraMessageText: {
+    color: COLORS.text,
+    fontSize: 13,
+    textAlign: 'center',
+  },
+
+  cameraRetryButton: {
+    paddingHorizontal: 20,
+    paddingVertical: 11,
+    borderRadius: 18,
+    backgroundColor: COLORS.primary,
+  },
+
+  cameraRetryText: {
+    color: COLORS.background,
+    fontSize: 12,
+    fontWeight: '800',
+  },
+
+  cameraHint: {
+    color: COLORS.muted,
+    fontSize: 12,
+    textAlign: 'center',
+    marginTop: 18,
+  },
+
+  myQrModal: {
+    width: '100%',
+    maxHeight: '100%',
+    alignItems: 'center',
+    padding: 20,
+    backgroundColor: COLORS.surface,
+    borderRadius: 26,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+
+  qrCodePaper: {
+    width: 252,
+    height: 252,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 22,
+    borderRadius: 20,
+    backgroundColor: '#FFFFFF',
+  },
+
+  qrOwnerName: {
+    color: COLORS.text,
+    fontSize: 13,
+    fontWeight: '700',
+    textAlign: 'center',
+    marginTop: 17,
+  },
+
   profileSetupModal: {
     width: '100%',
     maxWidth: 420,
     alignItems: 'center',
     padding: 22,
-    backgroundColor: COLORS.surface,
+    backgroundColor: '#14131A',
     borderWidth: 1,
     borderColor: COLORS.border,
-    borderRadius: 14,
+    borderRadius: 26,
   },
 
   profileSetupIcon: {
@@ -4126,7 +5174,7 @@ if (!granted) {
     backgroundColor: COLORS.card,
     borderWidth: 1,
     borderColor: COLORS.border,
-    borderRadius: 10,
+    borderRadius: 16,
     marginTop: 18,
   },
 
@@ -4145,7 +5193,7 @@ if (!granted) {
     paddingHorizontal: 8,
     borderWidth: 1,
     borderColor: COLORS.border,
-    borderRadius: 10,
+    borderRadius: 16,
   },
 
   profileSetupGeneratedText: {
@@ -4161,7 +5209,7 @@ if (!granted) {
     alignItems: 'center',
     justifyContent: 'center',
     backgroundColor: COLORS.primary,
-    borderRadius: 10,
+    borderRadius: 16,
   },
 
   profileSetupSaveButtonDisabled: {
@@ -4169,7 +5217,7 @@ if (!granted) {
   },
 
   profileSetupSaveText: {
-    color: COLORS.text,
+    color: COLORS.background,
     fontSize: 12,
     fontWeight: '800',
   },
@@ -4188,12 +5236,14 @@ if (!granted) {
     gap: 7,
     paddingHorizontal: 17,
     paddingVertical: 11,
-    backgroundColor: '#202F4C',
+    backgroundColor: '#282331',
     borderWidth: 1,
-    borderColor: '#344C75',
+    borderColor: '#4A3C68',
     borderRadius: 12,
     marginTop: 18,
   },
+
+
 
   editProfileButtonText: {
     color: COLORS.text,
@@ -4231,21 +5281,6 @@ if (!granted) {
     marginTop: 4,
   },
 
-  settingsCard: {
-    backgroundColor: COLORS.surface,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-    borderRadius: 18,
-    paddingHorizontal: 14,
-  },
-
-  settingRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: 15,
-    gap: 11,
-  },
-
   settingIcon: {
     width: 40,
     height: 40,
@@ -4270,11 +5305,6 @@ if (!granted) {
     fontSize: 10,
     lineHeight: 15,
     marginTop: 4,
-  },
-
-  settingDivider: {
-    height: 1,
-    backgroundColor: COLORS.border,
   },
 
   blockedDevicesList: {
@@ -4313,30 +5343,6 @@ if (!granted) {
     paddingBottom: 12,
   },
 
-  blockedDevicesEmpty: {
-    color: COLORS.muted,
-    fontSize: 12,
-    padding: 12,
-  },
-
-  profileFooter: {
-    alignItems: 'center',
-    paddingVertical: 30,
-  },
-
-  profileFooterBrand: {
-    color: COLORS.text,
-    fontSize: 15,
-    fontWeight: '800',
-    marginTop: 9,
-  },
-
-  profileFooterVersion: {
-    color: COLORS.muted,
-    fontSize: 10,
-    marginTop: 5,
-  },
-
   chatScreen: {
     flex: 1,
     backgroundColor: COLORS.background,
@@ -4348,9 +5354,9 @@ if (!granted) {
     gap: 9,
     paddingHorizontal: 12,
     paddingVertical: 13,
-    backgroundColor: COLORS.surface,
+    backgroundColor: 'rgba(17,25,33,0.96)',
     borderBottomWidth: 1,
-    borderBottomColor: COLORS.border,
+    borderBottomColor: 'rgba(226,238,255,0.08)',
   },
 
   chatScreenHeaderInfo: {
@@ -4384,13 +5390,13 @@ if (!granted) {
     paddingHorizontal: 12,
     paddingVertical: 9,
     borderRadius: 20,
-    backgroundColor: '#102320',
+    backgroundColor: 'rgba(130,167,255,0.1)',
     borderWidth: 1,
-    borderColor: '#23453E',
+    borderColor: 'rgba(130,167,255,0.24)',
   },
 
   chatEncryptionText: {
-    color: COLORS.green,
+    color: COLORS.blue,
     fontSize: 11,
     fontWeight: '700',
   },
@@ -4417,16 +5423,16 @@ if (!granted) {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
-    paddingHorizontal: 15,
-    paddingVertical: 12,
-    backgroundColor: COLORS.surface,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    backgroundColor: COLORS.background,
     borderTopWidth: 1,
-    borderTopColor: COLORS.border,
+    borderTopColor: 'rgba(226,238,255,0.1)',
   },
 
   chatToolButton: {
-    width: 36,
-    height: 42,
+    width: 44,
+    height: 46,
     alignItems: 'center',
     justifyContent: 'center',
     borderRadius: 10,
@@ -4448,20 +5454,20 @@ if (!granted) {
     backgroundColor: COLORS.card,
     borderWidth: 1,
     borderColor: COLORS.border,
-    borderRadius: 15,
+    borderRadius: 22,
   },
 
   chatComposerText: {
     flex: 1,
     color: COLORS.text,
-    fontSize: 12,
+    fontSize: 14,
     paddingVertical: 10,
   },
 
   chatSendButton: {
-    width: 47,
-    height: 47,
-    borderRadius: 15,
+    width: 48,
+    height: 48,
+    borderRadius: 16,
     backgroundColor: COLORS.primary,
     alignItems: 'center',
     justifyContent: 'center',
@@ -4497,15 +5503,15 @@ if (!granted) {
   },
   messageBubble: {
     maxWidth: '100%',
-    borderRadius: 17,
+    borderRadius: 21,
     paddingHorizontal: 13,
     paddingTop: 10,
     paddingBottom: 7,
     borderWidth: 1,
   },
   messageBubbleMine: {
-    backgroundColor: '#263D70',
-    borderColor: '#3B5BA0',
+    backgroundColor: '#25352D',
+    borderColor: '#40583A',
     borderBottomRightRadius: 5,
   },
   messageBubbleTheirs: {
@@ -4566,7 +5572,7 @@ if (!granted) {
     marginTop: 5,
   },
   messageTime: {
-    color: '#AAB7D0',
+    color: '#B4A9C8',
     fontSize: 9,
   },
   messageStatus: {
@@ -4596,12 +5602,25 @@ if (!granted) {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-around',
-    paddingTop: 10,
-    paddingBottom: Platform.OS === 'ios' ? 5 : 10,
-    paddingHorizontal: 5,
-    backgroundColor: COLORS.background,
+    height: 72,
+    marginHorizontal: 15,
+    marginTop: 4,
+    marginBottom: 8,
+    paddingTop: 5,
+    paddingBottom: 6,
+    paddingHorizontal: 8,
+    backgroundColor: COLORS.surface,
     borderTopWidth: 1,
-    borderTopColor: COLORS.border,
+    borderTopColor: 'rgba(255,255,255,0.17)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.12)',
+    borderRadius: 23,
+    overflow: 'hidden',
+    shadowColor: '#000000',
+    shadowOffset: { width: 0, height: 9 },
+    shadowOpacity: 0.3,
+    shadowRadius: 18,
+    elevation: 12,
   },
 
   navItem: {
@@ -4609,19 +5628,20 @@ if (!granted) {
     alignItems: 'center',
     justifyContent: 'center',
     gap: 5,
+    minHeight: 58,
   },
 
   navIconWrapper: {
-    width: 44,
-    height: 31,
+    width: 48,
+    height: 32,
     alignItems: 'center',
     justifyContent: 'center',
-    borderRadius: 12,
+    borderRadius: 18,
     position: 'relative',
   },
 
   navIconWrapperActive: {
-    backgroundColor: '#1A2743',
+    backgroundColor: 'rgba(184,243,107,0.12)',
   },
 
   navBadge: {
@@ -4638,7 +5658,7 @@ if (!granted) {
 
   navLabel: {
     color: COLORS.muted,
-    fontSize: 9,
+    fontSize: 11,
     fontWeight: '600',
   },
 
@@ -4657,10 +5677,10 @@ if (!granted) {
     gap: 10,
     paddingHorizontal: 14,
     paddingVertical: 13,
-    backgroundColor: '#1A2740',
+    backgroundColor: 'rgba(16,27,37,0.98)',
     borderWidth: 1,
-    borderColor: '#354D76',
-    borderRadius: 15,
+    borderColor: '#40384E',
+    borderRadius: 21,
     elevation: 8,
   },
 

@@ -1,4 +1,4 @@
-﻿import { NativeEventEmitter, NativeModules } from 'react-native';
+import { NativeEventEmitter, NativeModules } from 'react-native';
 
 const { NearbyConnections } = NativeModules;
 
@@ -25,6 +25,9 @@ function requireNativeModule() {
 
 export const nearby = {
   isAvailable: () => Boolean(NearbyConnections),
+
+  playScanStartSound: () =>
+    requireNativeModule().playScanStartSound(),
 
   startDiscovery: () =>
     requireNativeModule().startDiscovery(),

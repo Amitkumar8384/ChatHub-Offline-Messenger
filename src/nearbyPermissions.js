@@ -1,4 +1,4 @@
-﻿import { PermissionsAndroid, Platform } from 'react-native';
+import { PermissionsAndroid, Platform } from 'react-native';
 
 export async function requestNearbyPermissions() {
   if (Platform.OS !== 'android') {
@@ -13,14 +13,19 @@ export async function requestNearbyPermissions() {
       PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
       PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
       PermissionsAndroid.PERMISSIONS.BLUETOOTH_ADVERTISE,
-      PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
-      PermissionsAndroid.PERMISSIONS.ACCESS_COARSE_LOCATION,
     ];
 
     if (version >= 33) {
       permissions.push(
         PermissionsAndroid.PERMISSIONS.NEARBY_WIFI_DEVICES
       );
+    }
+
+    // Nearby discovery on this device's Google Play services checks both
+    // location permissions, including on Android 13+.
+    if (version >= 31) {
+      permissions.push(PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION);
+      permissions.push(PermissionsAndroid.PERMISSIONS.ACCESS_COARSE_LOCATION);
     }
 
     const results = await PermissionsAndroid.requestMultiple(permissions);
